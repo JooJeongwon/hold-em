@@ -9,7 +9,14 @@ async function post(path, data, cookie = '') {
 }
 async function player(name) {
   const { response } = await post('/api/session', {});
-  const cookie = response.headers.get('set-cookie').split(';')[0];
+  const anonymousCookie = response.headers.get('set-cookie').split(';')[0];
+  const registration = await post('/api/auth/register', {
+    username: `test_${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`,
+    displayName: name,
+    password: 'PokerTestPassword2026!',
+  }, anonymousCookie);
+  assert.equal(registration.response.status, 201);
+  const cookie = registration.response.headers.get('set-cookie').split(';')[0];
   return { name, cookie, room: null, errors: [], ws: null };
 }
 async function connect(p, code) {
@@ -35,14 +42,13 @@ try {
   assert.equal((await fetch(base+'/api/session',{method:'POST',headers:{Origin:'https://evil.example','Content-Type':'application/json'},body:'{}'})).status,403);
   assert.equal((await fetch(base+'/api/session',{method:'POST',body:'{}'})).status,415);
   const a=await player('검증 A'),b=await player('검증 B'); players.push(a,b);
-  const created=await post('/api/rooms',{nickname:a.name,roomName:'자동 검증 테이블'},a.cookie);
+  const created=await post('/api/rooms',{nickname:a.name,roomName:'자동 검증 토너먼트',format:{mode:'tournament',tournamentSpeed:'normal'},entryMethod:'money'},a.cookie);
   assert.equal(created.response.status,201); const code=created.data.code;
-  assert.equal((await post(`/api/rooms/${code}/join`,{nickname:b.name},b.cookie)).response.status,200);
+  assert.equal((await post(`/api/rooms/${code}/join`,{nickname:b.name,entryMethod:'money'},b.cookie)).response.status,200);
   await connect(a,code); await connect(b,code);
   assert.equal(a.room.players.length,2); assert.equal(b.room.players.length,2);
   assert.notEqual(a.room.me,b.room.me);
-  await send(a,'ready'); await send(b,'ready'); await send(a,'start');
-  await until(()=>b.room.stage==='preflop');
+  await until(()=>a.room.stage==='preflop'&&b.room.stage==='preflop');
   assert.ok(a.room.players.find(p=>p.id===a.room.me).cards.every(Number.isInteger));
   assert.deepEqual(a.room.players.find(p=>p.id===b.room.me).cards,[null,null]);
   assert.deepEqual(b.room.players.find(p=>p.id===a.room.me).cards,[null,null]);
@@ -57,14 +63,14 @@ try {
     await until(()=>a.room.revision===b.room.revision);
   }
   assert.equal(a.room.history.length,1);
-  assert.equal(a.room.ranking.reduce((s,p)=>s+p.net,0),0);
-  assert.equal(a.room.players.reduce((s,p)=>s+p.chips,0),60000);
-  const expected=JSON.stringify(a.room.ranking);
+  assert.equal(a.room.players.reduce((s,p)=>s+p.chips,0),20000);
+  assert.equal(a.room.players.find(p=>p.id===a.room.me).entries,1);
+  assert.equal(a.room.players.find(p=>p.id!==a.room.me).entries,undefined);
+  const expected=JSON.stringify(a.room.players.map(p=>p.entries));
   a.ws.close(); await delay(100); a.room=null; await connect(a,code);
-  assert.equal(JSON.stringify(a.room.ranking),expected);
+  assert.equal(JSON.stringify(a.room.players.map(p=>p.entries)),expected);
   assert.equal(a.room.history.length,1);
-  // A private queued fold runs on the server when the turn arrives and does not bump the shared revision.
-  await send(a,'ready'); await send(b,'ready'); await send(a,'start');
+  // A queued fold runs on the server when the turn arrives and does not bump the shared revision.
   await until(()=>a.room.hand===2&&b.room.hand===2&&a.room.revision===b.room.revision);
   const actor=players.find(p=>p.room.legal), waiter=players.find(p=>p!==actor);
   const before=waiter.room.revision;
@@ -75,13 +81,11 @@ try {
   await until(()=>a.room.stage==='finished'&&b.room.stage==='finished');
   assert.equal(a.room.history[0].actions.at(-1).text,'폴드');
   assert.equal(a.room.history[0].players.find(p=>p.id===waiter.room.me).folded,true);
-  assert.equal(a.room.players.reduce((s,p)=>s+p.chips,0),60000);
+  assert.equal(a.room.players.reduce((s,p)=>s+p.chips,0),20000);
   // Rejoining with the same browser identity must not create another seat.
-  await post(`/api/rooms/${code}/join`,{nickname:a.name},a.cookie);
+  await post(`/api/rooms/${code}/join`,{nickname:a.name,entryMethod:'money'},a.cookie);
   await until(()=>a.room.players.length===2);
-  await send(a,'leave'); await until(()=>b.room.players.length===1);
-  assert.equal(b.room.hostId,b.room.me);
-  console.log('PASS: authentication, origin checks, two-player WebSocket sync, hidden cards, stale actions, full hand, chip conservation, ranking, reconnect, queued actions, hand history and host transfer');
+  console.log('PASS: authentication, origin checks, tournament buy-in, two-player WebSocket sync, hidden cards, stale actions, full hand, chip conservation, reconnect, queued actions and hand history');
 } finally {
   for(const p of players) p.ws?.close();
 }

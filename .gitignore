@@ -4,3 +4,6 @@ node_modules/
 .env*
 dist/
 test-artifacts/
+.DS_Store
+/IMG_*.PNG
+/roomsource/

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "wrangler dev --port 8787",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/worker.js && node --check src/poker.js && node --check public/app.js && node --check public/guide.js",
+    "check": "node --check src/worker.js && node --check src/game/holdem.js && node --check src/game/format.js && node --check src/game/room.js && node --check src/game/migrations.js && node --check src/game/view.js && node --check src/platform/random.js && node --check src/platform/password.js && node --check public/app.js && node --check public/betting.js",
     "deploy": "wrangler deploy",
     "deploy:check": "wrangler deploy --dry-run"
   },

@@ -1,9 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "river-friends-holdem",
+  "name": "hold-em",
   "main": "src/worker.js",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
+  "routes": [{ "pattern": "hold-em.jwjoo.com", "custom_domain": true }],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
@@ -13,6 +14,12 @@
   "durable_objects": {
     "bindings": [{ "name": "ROOMS", "class_name": "PokerRoom" }]
   },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "hold-em",
+    "database_id": "93a8d24f-bdd3-4648-afb0-20ac104f1e31",
+    "migrations_dir": "migrations"
+  }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PokerRoom"] }],
   "observability": { "enabled": false }
 }

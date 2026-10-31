@@ -1,196 +1,62 @@
-import { raisePresets, raisePreview } from './betting.js';
+import { DEFAULT_BET_SIZES, raisePresets, raisePreview } from './betting.js';
 
 const $ = selector => document.querySelector(selector);
 const app = $('#app');
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const format = value => Number(value || 0).toLocaleString('ko-KR');
-const projectLinks = '<nav class="project-links" aria-label="프로젝트 링크"><a class="outline" href="https://github.com/beyejin/river-friends-holdem/issues/new?labels=bug" target="_blank" rel="noopener">버그 제보하기 ↗</a><a class="outline" href="https://github.com/beyejin/river-friends-holdem" target="_blank" rel="noopener">GitHub 바로가기 ↗</a></nav>';
+const accountName = account => account?.displayName || account?.username || '';
+const RING_ROOM_ID = 'ring-sixmax';
 const stages = { waiting: '친구를 기다리는 중', preflop: '프리플롭', flop: '플롭', turn: '턴', river: '리버', finished: '핸드 종료' };
 const suits = ['♠', '♥', '♣', '♦'];
-const defaultMembers = ['한예진', '김영광', '남성수', '박진환', '배정호', '엄태웅', '주정원'].map(name => ({ key: `default:${name}`, name, cohort: '' }));
-let room, socket, retryTimer, toastTimer, panel = 'ranking', pending = false, reconnectAttempt = 0, ledgerFormOpen = false, ledgerEditing = null, manualLedgerOpen = false, manualEditing = null, manualSessions = [];
-let members = defaultMembers, recordMembers = defaultMembers, memberDeleting = false, memberDeleteTarget = null;
-let manualDraft = null, manualSaving = false, rankingSort = 'wins', rankingStatus = 'loading';
-let leaderboard = defaultMembers.map(member => ({ name: member.name, weeklyWins: 0, net: 0, finalChips: 0 }));
-let selectedMemberKey = readLocal('river-member-key', 'default:한예진');
-let connected = false;
-let replyTimer, resumeTimer;
-let renderedTurn = null, ledgerDraft = null, ledgerSavePending = null;
-// Server states are shown one at a time so bets, new cards and results stay readable.
+let room, socket, account = null, retryTimer, toastTimer, panel = 'history', pending = false, reconnectAttempt = 0;
+let ringLobbyPlayers = [], ringLobbyTimer, connected = false;
+let displayUnit = 'chips', betSizes = {}, calculatorValue = '0';
+let currentTournament = null;
+let inviteFormat = null, inviteInfoCode = '', pendingRoomId = null;
+let replyTimer, resumeTimer, renderedTurn = null;
 let stateQueue = [], queueTimer = null, animFrom = null, latestRoom = null;
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-let showBB = readLocal('river-show-bb', 'false') === 'true';
-let fourColour = readLocal('river-four-colour', 'false') === 'true';
-let animationSpeed = readLocal('river-animation-speed', 'normal');
-let showQueue = readLocal('river-show-queue', 'true') === 'true';
 let openHands = new Set();
-if (!['normal', 'fast', 'instant'].includes(animationSpeed)) animationSpeed = 'normal';
 let code = new URLSearchParams(location.search).get('room') || '';
-let nickname = readLocal('river-nickname', '');
 function readLocal(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch { return fallback; } }
 function saveLocal(key, value) { try { localStorage.setItem(key, value); } catch { /* Private browser storage can be unavailable. */ } }
-function recentRooms() { try { return JSON.parse(readLocal('river-rooms', '[]')); } catch { return []; } }
-function renderMemberOptions() {
-  const select = $('#member-select');
-  if (!select) return;
-  const selectingNew = select.value === '__new__';
-  if (!members.some(member => member.key === selectedMemberKey)) selectedMemberKey = members[0]?.key || '';
-  const selected = members.findIndex(member => member.key === selectedMemberKey);
-  select.innerHTML = `${members.map((member, i) => `<option value="${i}" ${i === selected ? 'selected' : ''}>${member.cohort ? `${escape(member.cohort)} ` : ''}${escape(member.name)}</option>`).join('')}<option value="__new__">새 회원 등록</option>`;
-  if (selectingNew || !members.length) select.value = '__new__';
-  $('#new-member-fields').hidden = select.value !== '__new__';
-  $('#entry-button').textContent = select.value === '__new__' ? '등록하고 입장하기 →' : code ? '테이블 입장하기 →' : '새 테이블 만들기 →';
+function defaultBetSizes() {
+  return Object.fromEntries(['ring', 'tournament'].map(mode => [mode, {
+    preflop: structuredClone(DEFAULT_BET_SIZES.preflop), postflop: structuredClone(DEFAULT_BET_SIZES.postflop),
+  }]));
 }
-function setMembers(data) {
-  members = data.members;
-  recordMembers = data.recordMembers || data.members;
+function validSize(size) {
+  return size && ['bb', 'pot'].includes(size.unit) && Number.isFinite(size.value)
+    && (size.unit === 'bb' ? size.value >= 0.5 && size.value <= 100 : size.value >= 1 && size.value <= 1000);
 }
-function renderMemberManager() {
-  $('#member-management-list').hidden = Boolean(memberDeleteTarget);
-  $('#member-delete-confirmation').hidden = !memberDeleteTarget;
-  $('#member-delete-question').textContent = memberDeleteTarget ? `${memberLabel(memberDeleteTarget)} 멤버를 삭제할까요?` : '';
-  $('#confirm-member-delete').disabled = memberDeleting;
-  $('#cancel-member-delete').disabled = memberDeleting;
-  $('#confirm-member-delete').textContent = memberDeleting ? '삭제 중…' : '삭제 확인';
-  $('#member-management-list').innerHTML = members.map(member => `<li><b>${escape(memberLabel(member))}</b><button type="button" class="outline member-delete" data-member-delete="${escape(member.key)}" aria-label="${escape(memberLabel(member))} 삭제" ${memberDeleting ? 'disabled' : ''}>삭제</button></li>`).join('') || '<li>등록된 멤버가 없어요. 홈에서 새 회원을 등록해 주세요.</li>';
-}
-async function loadMembers() {
-  const response = await fetch('/api/members');
-  if (!response.ok) throw new Error('회원 명단을 불러오지 못했어요.');
-  setMembers(await response.json());
-  renderMemberOptions();
-  renderMemberManager();
-}
-async function loadLeaderboard() {
+function loadBetSizes() {
+  const defaults = defaultBetSizes();
   try {
-    await Promise.all(recentRooms().map(async room => {
-      try { await fetch(`/api/rooms/${room.id}/sync-ledger`); } catch { /* Retry when this table reconnects. */ }
-    }));
-    const response = await fetch('/api/leaderboard');
-    if (!response.ok) throw new Error('랭킹을 불러오지 못했어요.');
-    const data = await response.json();
-    leaderboard = data.ranking;
-    manualSessions = data.sessions || [];
-    rankingStatus = 'ready';
-  } catch { rankingStatus = 'error'; }
-  renderHomeLeaderboard();
-}
-const koreaDate = timestamp => new Date(timestamp + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
-function localDateTime(timestamp) {
-  return new Date(timestamp + 9 * 60 * 60 * 1000).toISOString().slice(0, 16);
-}
-function memberLabel(member) { return `${member.cohort ? `${member.cohort} ` : ''}${member.name}`; }
-function playerMemberKey(player) {
-  return player.memberKey || recordMembers.find(member => member.name === player.name)?.key || `legacy:${player.name}`;
-}
-function deletedMemberLabel(key) {
-  return recordMembers.some(member => member.key === key) && !members.some(member => member.key === key) ? '<span class="deleted-member-label">삭제된 멤버</span>' : '';
-}
-function readManualDraft() {
-  const form = $('#home-record-form');
-  if (!form) return manualDraft;
-  return { date: form.elements.date.value, players: [...form.querySelectorAll('[data-home-row]')].map(row => ({
-    memberKey: row.querySelector('[data-home-player]').value,
-    selected: row.querySelector('[data-home-player]').checked,
-    rebuys: row.querySelector('[data-home-rebuys]').value,
-    wins: row.querySelector('[data-home-wins]').value,
-    times: [...row.querySelectorAll('[data-home-rebuy-time]')].map(input => input.value),
-  })) };
-}
-function draftForSession(session) {
-  return { date: session?.date || koreaDate(Date.now()), players: (session?.players || []).map(player => ({
-    memberKey: playerMemberKey(player), selected: true, rebuys: player.rebuys, wins: player.wins || 0,
-    times: Array.from({ length: player.rebuys }, (_, index) => player.rebuyEvents?.[index] == null ? '' : localDateTime(player.rebuyEvents[index])),
-  })) };
-}
-function homeRebuyTimes(times, label = '', disabled = false) {
-  return times.map((value, index) => `<label>리바인 ${index + 1} 날짜와 시각<input aria-label="${escape(label)} 리바인 ${index + 1} 날짜와 시각" type="datetime-local" data-home-rebuy-time value="${escape(value)}" ${disabled ? 'disabled' : ''}><small>비워두면 미기록</small></label>`).join('');
-}
-function homeLeaderboardContent() {
-  const editing = manualSessions.find(session => session.id === manualEditing);
-  const draft = manualDraft || draftForSession(editing);
-  const formMembers = [...members];
-  for (const player of editing?.players || []) if (!formMembers.some(member => member.key === playerMemberKey(player))) formMembers.push(recordMembers.find(member => member.key === playerMemberKey(player)) || { key: playerMemberKey(player), name: player.name, cohort: player.cohort || '' });
-  const rows = manualLedgerOpen ? formMembers.map(member => {
-    const player = draft.players.find(item => item.memberKey === member.key);
-    const selected = Boolean(player?.selected), label = memberLabel(member);
-    return `<div class="home-record-row" data-home-row><label><input type="checkbox" data-home-player value="${escape(member.key)}" ${selected ? 'checked' : ''}><b>${escape(label)}</b>${deletedMemberLabel(member.key)}</label><label data-player-fields ${selected ? '' : 'hidden'}>리바인<input aria-label="${escape(label)} 리바인 횟수" type="number" min="0" max="100" step="1" value="${escape(player?.rebuys ?? 0)}" data-home-rebuys required ${selected ? '' : 'disabled'}></label><label data-player-fields ${selected ? '' : 'hidden'}>승리<input aria-label="${escape(label)} 승리 횟수" type="number" min="0" max="1000" step="1" value="${escape(player?.wins ?? 0)}" data-home-wins required ${selected ? '' : 'disabled'}></label><div class="home-rebuy-times" data-player-fields data-home-rebuy-times ${selected ? '' : 'hidden'}>${homeRebuyTimes(player?.times || [], label, !selected)}</div></div>`;
-  }).join('') : '';
-  const history = [...manualSessions].sort((a, b) => b.date.localeCompare(a.date)).map(session => `<article class="home-session"><header><b>${escape(session.date)}</b><button type="button" class="outline" data-home-edit="${escape(session.id)}" ${manualSaving ? 'disabled' : ''}>수정</button></header>${session.players.map(player => {
-    const times = Array.from({ length: player.rebuys }, (_, index) => {
-      const at = player.rebuyEvents?.[index];
-      return `<li>리바인 ${index + 1}: ${at == null ? '<span class="unrecorded">미기록</span>' : `<time>${escape(new Date(at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }))}</time>`}</li>`;
-    }).join('');
-    return `<div><p><b>${escape(memberLabel(player))}${deletedMemberLabel(playerMemberKey(player))}</b><span>승리 ${player.wins ?? 0}회 / 리바인 ${player.rebuys}회</span></p>${times ? `<details><summary>리바인 시각${Array.from({length: player.rebuys}, (_, i) => player.rebuyEvents?.[i]).some(at => at == null) ? ' (미기록 포함)' : ''}</summary><ol>${times}</ol></details>` : ''}</div>`;
-  }).join('')}</article>`).join('');
-  const ranked = [...leaderboard].sort((a, b) => rankingSort === 'rebuys' ? (b.rebuys || 0) - (a.rebuys || 0) || b.weeklyWins - a.weeklyWins : b.weeklyWins - a.weeklyWins || (b.wins || 0) - (a.wins || 0));
-  return `<header class="home-ranking-heading"><h2 id="home-ranking-title">주간 랭킹</h2><button id="home-record-toggle" class="outline" ${manualSaving ? 'disabled' : ''}>${manualLedgerOpen ? '기록 닫기' : '지난 게임 기록'}</button></header><div class="home-ranking-sort" role="group" aria-label="랭킹 정렬"><button type="button" data-ranking-sort="wins" aria-pressed="${rankingSort === 'wins'}">주간 우승순</button><button type="button" data-ranking-sort="rebuys" aria-pressed="${rankingSort === 'rebuys'}">누적 리바인순</button></div><p class="home-ranking-note">월요일부터 일요일까지, 한국 시간 기준입니다.</p>${rankingStatus === 'loading' ? '<p role="status">랭킹을 불러오는 중…</p>' : rankingStatus === 'error' ? '<p role="status">최신 랭킹을 불러오지 못했어요. <button id="ranking-retry" class="outline">다시 시도</button></p>' : ''}<div class="home-ranking-columns"><span>이름</span><span>주간 우승</span><span>누적 리바인</span></div><ol class="home-ranking-list">${ranked.map((player, index) => `<li><span class="home-rank-number">${index + 1}</span><b>${escape(memberLabel(player))}${player.deleted ? '<span class="deleted-member-label">삭제된 멤버</span>' : ''}</b><span class="home-rank-wins">${rankingStatus === 'loading' ? '—' : `${player.weeklyWins ?? 0}회`}</span><span class="home-rank-rebuys">${rankingStatus === 'loading' ? '—' : `${player.rebuys ?? 0}회`}</span></li>`).join('')}</ol>${manualLedgerOpen ? `<form id="home-record-form" class="home-record-form"><h3 class="home-record-title" tabindex="-1">${editing ? '게임 기록 수정' : '지난 게임 추가'}</h3><fieldset ${manualSaving ? 'disabled' : ''}><label class="home-record-date">게임 날짜<input type="date" name="date" value="${escape(draft.date)}" required></label><p class="home-record-help">참가자 2~9명을 선택하세요. 리바인 날짜와 시각은 한국 시간으로 입력하며, 모르면 비워두세요.</p><div class="home-record-rows">${rows}</div><p id="home-record-error" role="alert"></p><div class="home-record-actions"><button type="submit" class="primary">${manualSaving ? '저장 중…' : editing ? '수정 저장' : '기록 저장'}</button><button type="button" id="home-record-cancel" class="outline">취소</button></div></fieldset></form>` : ''}<section class="home-session-history"><h3>게임별 기록</h3>${history || '<p>지난 게임을 추가하면 여기에서 다시 열고 수정할 수 있어요.</p>'}</section>`;
-}
-function renderHomeLeaderboard(preserveDraft = true) {
-  const target = $('#home-leaderboard');
-  if (!target) return;
-  if (preserveDraft) manualDraft = readManualDraft();
-  target.innerHTML = homeLeaderboardContent();
-  $('#home-record-toggle').onclick = () => {
-    manualLedgerOpen = !manualLedgerOpen; manualEditing = null; manualDraft = null;
-    renderHomeLeaderboard(false);
-    $('.home-record-title')?.focus();
-  };
-  $('#ranking-retry')?.addEventListener('click', loadLeaderboard);
-  target.querySelectorAll('[data-ranking-sort]').forEach(button => button.onclick = () => { rankingSort = button.dataset.rankingSort; renderHomeLeaderboard(); });
-  target.querySelectorAll('[data-home-edit]').forEach(button => button.addEventListener('click', () => {
-    manualEditing = button.dataset.homeEdit; manualLedgerOpen = true;
-    manualDraft = draftForSession(manualSessions.find(session => session.id === manualEditing));
-    renderHomeLeaderboard(false); $('.home-record-title')?.focus();
-  }));
-  $('#home-record-cancel')?.addEventListener('click', () => { manualLedgerOpen = false; manualEditing = null; manualDraft = null; renderHomeLeaderboard(false); $('#home-record-toggle').focus(); });
-  target.querySelectorAll('[data-home-player]').forEach(input => input.addEventListener('change', () => {
-    const row = input.closest('[data-home-row]');
-    row.querySelectorAll('[data-player-fields]').forEach(field => { field.hidden = !input.checked; });
-    row.querySelectorAll('input:not([type=checkbox])').forEach(field => { field.disabled = !input.checked; });
-  }));
-  target.querySelectorAll('[data-home-rebuys]').forEach(input => input.addEventListener('input', () => {
-    if (!input.validity.valid) return;
-    const row = input.closest('[data-home-row]');
-    const previous = [...row.querySelectorAll('[data-home-rebuy-time]')].map(field => field.value);
-    const times = Array.from({ length: Number(input.value) }, (_, index) => previous[index] || '');
-    row.querySelector('[data-home-rebuy-times]').innerHTML = homeRebuyTimes(times, row.querySelector('b').textContent);
-  }));
-  $('#home-record-form')?.addEventListener('submit', async event => {
-    event.preventDefault();
-    if (manualSaving) return;
-    const form = event.currentTarget;
-    const players = [...form.querySelectorAll('[data-home-player]:checked')].map(checkbox => {
-      const row = checkbox.closest('[data-home-row]');
-      const member = recordMembers.find(item => item.key === checkbox.value);
-      const oldPlayer = manualSessions.find(session => session.id === manualEditing)?.players.find(player => playerMemberKey(player) === checkbox.value);
-      const rebuys = Number(row.querySelector('[data-home-rebuys]').value);
-      const fields = [...row.querySelectorAll('[data-home-rebuy-time]')];
-      const rebuyEvents = Array.from({ length: rebuys }, (_, index) => {
-        const value = fields[index]?.value;
-        if (!value) return null;
-        const previous = oldPlayer?.rebuyEvents?.[index];
-        return previous != null && localDateTime(previous) === value ? previous : Date.parse(`${value}+09:00`);
-      });
-      return { memberKey: member?.key || oldPlayer?.memberKey, name: member?.name || oldPlayer?.name, rebuys, rebuyEvents, wins: Number(row.querySelector('[data-home-wins]').value) };
-    });
-    if (players.length < 2 || players.length > 9) { $('#home-record-error').textContent = '참가자는 2~9명을 선택해 주세요.'; return; }
-    const data = { sessionId: manualEditing, date: form.elements.date.value, players };
-    manualDraft = readManualDraft(); manualSaving = true;
-    renderHomeLeaderboard(false);
-    try {
-      await api('/api/session');
-      const result = await api('/api/leaderboard/session', data);
-      manualSessions = [result.session, ...manualSessions.filter(session => session.id !== result.session.id)];
-      manualLedgerOpen = false; manualEditing = null; manualDraft = null; manualSaving = false;
-      renderHomeLeaderboard(false);
-      notify(data.sessionId ? '게임 기록을 수정했어요.' : '게임 기록을 저장했어요.');
-      await loadLeaderboard();
-    } catch (error) {
-      manualSaving = false; renderHomeLeaderboard(false);
-      $('#home-record-error').textContent = error.message;
+    const saved = JSON.parse(readLocal('river-bet-sizes', '{}'));
+    for (const mode of ['ring', 'tournament']) for (const [street, min, max] of [['preflop', 4, 4], ['postflop', 4, 6]]) {
+      const sizes = saved[mode]?.[street];
+      if (Array.isArray(sizes) && sizes.length >= min && sizes.length <= max && sizes.every(validSize)) defaults[mode][street] = sizes;
     }
-  });
+  } catch { /* Use the built-in presets when browser storage is unavailable or invalid. */ }
+  return defaults;
+}
+displayUnit = readLocal('river-chip-unit', 'chips') === 'bb' ? 'bb' : 'chips';
+betSizes = loadBetSizes();
+function recentRooms() { try { return JSON.parse(readLocal('river-rooms', '[]')); } catch { return []; } }
+function entryButtonLabel() {
+  if (code && code !== RING_ROOM_ID) return '토너먼트 참가하기 →';
+  return currentTournament ? '현재 토너먼트 참가하기 →' : '토너먼트 시작하기 →';
+}
+function ringLobbyRows() {
+  return ringLobbyPlayers.length ? `<ol class="ring-lobby-list">${ringLobbyPlayers.map(player => `<li><b>${escape(player.name)}</b><span>${player.seated ? '테이블 참가 중' : '퇴장'}</span><strong>이번 주 추가 ${format(player.weeklyBuyIns)}회</strong></li>`).join('')}</ol>` : '<p class="ring-lobby-empty">이번 주 추가 바이인 기록이 없습니다.</p>';
+}
+async function loadRingLobby() {
+  try {
+    const result = await api('/api/ring/lobby', undefined, 'GET');
+    ringLobbyPlayers = result.players;
+    const target = $('#ring-lobby-list');
+    if (target) target.innerHTML = ringLobbyRows();
+  } catch { /* The public lobby stays usable if ring statistics are unavailable. */ }
 }
 function card(value, extra = '') {
   if (value === undefined) return '<div class="card placeholder" aria-label="아직 공개되지 않은 카드">♧</div>';
@@ -199,90 +65,183 @@ function card(value, extra = '') {
   return `<div class="card suit-${suit} ${suit % 2 ? 'red' : ''} ${extra}" aria-label="${['스페이드', '하트', '클럽', '다이아몬드'][suit]} ${rank}"><b>${({ 11: 'J', 12: 'Q', 13: 'K', 14: 'A' })[rank] || rank}</b><span>${suits[suit]}</span></div>`;
 }
 function tableAmount(value) {
-  return showBB ? `${(value / room.bigBlind).toLocaleString('ko-KR', { maximumFractionDigits: 2 })} BB` : format(value);
+  return displayUnit === 'bb' && room?.bigBlind
+    ? `${(Number(value) / room.bigBlind).toLocaleString('ko-KR', { maximumFractionDigits: 2 })} BB`
+    : format(value);
 }
 function notify(text) { $('#toast').textContent = text; $('#toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('#toast').hidden = true; }, 4500); }
 async function api(path, data, method = 'POST') {
-  const response = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+  const options = { method, headers: {} };
+  if (method !== 'GET') { options.headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(data || {}); }
+  const response = await fetch(path, options);
   let payload;
   try { payload = await response.json(); } catch { throw new Error('서버에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.'); }
   if (!response.ok) throw new Error(payload.error || '요청을 처리하지 못했습니다.');
   return payload;
 }
+function renderAuthHeader() {
+  const label = $('#account-indicator'), button = $('#logout-button');
+  if (!label || !button) return;
+  label.hidden = !account;
+  button.hidden = !account;
+  label.textContent = account ? `${accountName(account)} · ${format(account.money)} 머니` : '';
+}
+async function logout() {
+  try { await api('/api/auth/logout'); } catch { /* Clearing the browser cookie also ends an unavailable server session. */ }
+  account = null; room = null; code = ''; pendingRoomId = null;
+  clearTimeout(retryTimer); clearTimeout(replyTimer); clearTimeout(resumeTimer);
+  if (socket) { socket.onclose = null; socket.close(); socket = null; }
+  connected = false; pending = false; latestRoom = null;
+  clearStateQueue();
+  history.replaceState({}, '', '/');
+  renderAuthHeader(); home();
+}
+async function resumeRoom() {
+  if (!account || !code) return;
+  try {
+    const data = { nickname: accountName(account), entryMethod: account.money >= 10000 ? 'money' : 'count' };
+    if (code === RING_ROOM_ID) account = (await api('/api/ring/join', data)).account;
+    else {
+      const info = await api(`/api/rooms/${code}/info`, undefined, 'GET');
+      if (!info.canJoin) { notify('토너먼트 참가가 마감됐거나 자리가 없습니다.'); return; }
+      const result = await api(`/api/rooms/${code}/join`, data);
+      if (result.account) account = result.account;
+    }
+    renderAuthHeader();
+    connect();
+  } catch (error) { notify(error.message); }
+}
 function home() {
-  app.className = 'home';
+  app.className = account ? 'home lobby' : 'home auth';
   document.body.classList.remove('in-game');
-  const invited = Boolean(code);
-  app.innerHTML = `<section class="welcome">
-    <h1>우리들의 <em>홀덤.</em></h1>
-    <p class="intro">최대 9명, 시작 칩 20,000</p>
-    <form id="entry-form" class="entry-form">
-      <div class="form-title"><h2>${invited ? '친구의 테이블에 초대받았어요' : '테이블 열기'}</h2></div>
-      <label for="member-select">이름 선택</label><select id="member-select" name="member" required></select>
-      <div id="new-member-fields" hidden><label for="member-cohort">기수</label><input id="member-cohort" maxlength="20" placeholder="예: 9기"><label for="member-name">이름</label><input id="member-name" maxlength="20" placeholder="이름을 입력해 주세요"><button type="button" id="register-only" class="outline register-only">등록만 하기</button><p class="form-note">등록 후에도 테이블은 나중에 열 수 있어요.</p></div>
-      ${invited ? `<p class="invite-hint">초대 코드 <span>${escape(code)}</span></p>` : ''}
-      <button class="primary large" id="entry-button">${invited ? '테이블 입장하기' : '새 테이블 만들기'} <span>→</span></button>
-      ${invited ? '<a class="back-home" href="/">내 테이블 새로 만들기</a>' : ''}
-    </form>
-    <button type="button" id="manage-members" class="outline manage-members" aria-haspopup="dialog">멤버 관리</button>
+  const invited = Boolean(code && code !== RING_ROOM_ID);
+  const creating = !invited;
+  if (!invited) currentTournament = null;
+  if (inviteInfoCode !== code) { inviteInfoCode = code; inviteFormat = null; }
+  const tournament = creating || (invited && inviteFormat?.mode === 'tournament');
+  if (!account) {
+    clearInterval(ringLobbyTimer);
+    app.innerHTML = `<section class="welcome">
+      <h1>우리들의 <em>홀덤.</em></h1>
+      <p class="intro">친구들과 함께하는 홀덤 테이블</p>
+      <form id="account-form" class="entry-form account-form"><div class="form-title"><h2>로그인 / 계정 만들기</h2></div><label for="account-username">아이디</label><input id="account-username" name="username" autocomplete="username" required><label for="account-display-name">이름 (가입 시 표시)</label><input id="account-display-name" name="displayName" autocomplete="name" maxlength="20"><label for="account-password">비밀번호</label><input id="account-password" name="password" type="password" autocomplete="current-password" required><div class="lobby-actions"><button class="outline" name="authAction" value="login">로그인</button><button class="primary" name="authAction" value="register">가입하기</button></div><p class="form-note">새 계정은 아이디와 비밀번호를 각각 4자 이상으로 입력해 주세요. 가입할 때 이름을 입력해 주세요. 가입 시 개인 머니 10,000이 지급됩니다. 비밀번호를 잊으면 현재는 재설정할 수 없습니다.</p></form>
+    </section>`;
+    $('#account-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const submitter = event.submitter;
+      const action = submitter?.value === 'register' ? 'register' : 'login';
+      const form = event.currentTarget;
+      if (form.dataset.busy) return;
+      const username = form.elements.username.value.trim();
+      const displayName = form.elements.displayName.value.trim();
+      const password = form.elements.password.value;
+      if (action === 'register' && (username.length < 4 || password.length < 4)) { notify('아이디와 비밀번호를 각각 4자 이상 입력해 주세요.'); return; }
+      if (action === 'register' && !displayName) { notify('이름을 입력해 주세요.'); return; }
+      form.dataset.busy = 'true';
+      form.querySelectorAll('button').forEach(button => { button.disabled = true; });
+      try {
+        await api('/api/session');
+        const result = await api(`/api/auth/${action}`, { username, password, ...(action === 'register' ? { displayName } : {}) });
+        account = result.account;
+        renderAuthHeader(); home(); await resumeRoom();
+      } catch (error) { form.dataset.busy = ''; notify(error.message); form.querySelectorAll('button').forEach(button => { button.disabled = false; }); }
+    });
+    return;
+  }
+  app.innerHTML = `<section class="lobby-heading">
+    <div><p class="eyebrow">RIVER LOBBY</p><h1>${escape(accountName(account))}님, 게임을 선택하세요.</h1><p class="intro">링게임 또는 토너먼트에 바로 입장할 수 있어요.</p></div>
+    <section class="account-card" aria-label="내 계정"><b>${escape(accountName(account))}님</b><p>개인 머니 <strong>${format(account.money)}</strong></p><small>링게임 입장 시 바이인 차감 · 퇴장 시 남은 칩 환급</small>${account.money <= 5000 ? '<button type="button" id="ring-topup" class="outline">개인 머니를 10,000으로 충전</button>' : ''}</section>
   </section>
-  <section id="home-leaderboard" class="home-leaderboard" aria-labelledby="home-ranking-title">${homeLeaderboardContent()}</section>
-  ${!invited && recentRooms().length ? `<section class="recent"><h2>다시 모이는 곳</h2>${recentRooms().map(r => `<a href="/?room=${escape(r.id)}"><span>♠ ${escape(r.name)}</span><span>이어 들어가기 ↗</span></a>`).join('')}</section>` : ''}
-  <footer class="home-footer"><span>최대 9명 / 20,000 가상 칩</span><span>현금 결제와 환전이 없는 친구용 게임</span>${projectLinks}</footer>`;
-  $('#manage-members').onclick = async () => {
-    $('#member-management-error').textContent = '';
-    $('#member-management-list').textContent = '멤버를 불러오는 중…';
-    $('#member-management').showModal();
-    try { await loadMembers(); } catch (error) { $('#member-management-list').textContent = ''; $('#member-management-error').textContent = error.message; }
+  <section class="game-selection" aria-label="게임 선택">
+    <article class="game-option"><p class="eyebrow">6 MAX · CASH GAME</p><h2>링게임</h2><p>블라인드 100 / 200 · 시작 스택 10,000칩 (50 BB)</p><button type="button" id="ring-entry" class="primary large">링게임 입장하기 <span>→</span></button></article>
+    <article class="game-option"><p class="eyebrow">9 MAX · TOURNAMENT</p><h2>${invited ? '초대 토너먼트' : '토너먼트'}</h2><p id="tournament-description">시작 칩 10,000 · 최대 9명 · 리엔트리 최대 2회</p>
+      <form id="entry-form" class="tournament-form">
+        <div id="tournament-speed-field" ${creating ? '' : 'hidden'}><label for="tournament-speed">블라인드 레벨업</label><select id="tournament-speed"><option value="normal">기본 · 6분</option><option value="turbo">터보 · 3분</option></select></div>
+        <div id="tournament-entry-field" ${tournament ? '' : 'hidden'}><label for="tournament-entry-method">바이인 방식</label><select id="tournament-entry-method"><option value="money" ${account.money < 10000 ? 'disabled' : ''}>개인 머니 10,000 사용</option><option value="count" ${account.money >= 10000 ? 'disabled' : ''}>바이인 횟수 +1</option></select><p class="form-note">개인 머니가 10,000 이상이면 머니를 먼저 사용합니다.</p></div>
+        ${invited ? `<p class="invite-hint">초대 코드 <span>${escape(code)}</span></p>` : ''}
+        <button class="primary large" id="entry-button">${entryButtonLabel()}</button>
+      </form>
+    </article>
+  </section>
+  <section class="ring-lobby weekly-buyins" aria-labelledby="ring-lobby-title"><header><h2 id="ring-lobby-title">이번 주 링게임 추가 바이인</h2><p>한국 시간 기준 월요일부터 일요일까지 · 게임 중 직접 추가한 바이인만 집계합니다. 머니로 입장하거나 재입장한 횟수는 제외합니다.</p></header><div id="ring-lobby-list">${ringLobbyRows()}</div></section>
+  <footer class="home-footer"><span>가상 칩 게임 · 결제와 환전 없음</span></footer>`;
+  const updateTournamentFields = () => {
+    if (!invited && currentTournament) {
+      $('#tournament-speed-field').hidden = true;
+      $('#tournament-entry-field').hidden = true;
+      const state = currentTournament.startedAt === null ? '시작 대기' : `블라인드 ${format(currentTournament.bigBlind)}`;
+      $('#tournament-description').textContent = `${currentTournament.name} · ${currentTournament.players}/${currentTournament.maxPlayers}명 · ${state} · 5BB까지 참가 가능`;
+    } else {
+      const speed = invited ? inviteFormat?.tournamentSpeed : $('#tournament-speed')?.value;
+      $('#tournament-speed-field').hidden = !creating;
+      $('#tournament-entry-field').hidden = !tournament;
+      $('#tournament-description').textContent = `시작 칩 10,000 · ${speed === 'turbo' ? '터보 3분' : '기본 6분'} · 최대 9명 · 리엔트리 최대 2회 · 5BB까지 참가 가능`;
+    }
+    $('#entry-button').textContent = entryButtonLabel();
   };
+  $('#tournament-speed')?.addEventListener('change', updateTournamentFields);
+  if (!invited) api('/api/tournaments/current', undefined, 'GET').then(result => {
+    currentTournament = result.room;
+    updateTournamentFields();
+  }).catch(() => {});
+  if (invited) {
+    const requestedCode = code;
+    api(`/api/rooms/${requestedCode}/info`, undefined, 'GET').then(info => {
+      if (code !== requestedCode || !$('#entry-form')) return;
+      inviteInfoCode = requestedCode; inviteFormat = info.format;
+      updateTournamentFields();
+      $('#tournament-entry-field').hidden = info.format.mode !== 'tournament';
+      $('#entry-button').disabled = !info.canJoin;
+      if (!info.canJoin) $('#entry-button').textContent = '이미 시작된 토너먼트';
+    }).catch(error => notify(error.message));
+  }
+  $('#ring-topup')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      account = (await api('/api/ring/topup', {})).account;
+      renderAuthHeader(); home();
+      notify('개인 머니를 10,000으로 충전했어요.');
+    } catch (error) { notify(error.message); button.disabled = false; }
+  });
+  $('#ring-entry').addEventListener('click', async event => {
+    const button = event.currentTarget;
+    button.disabled = true; button.textContent = '테이블에 연결하는 중…';
+    try {
+      await api('/api/session');
+      const result = await api('/api/ring/join', { nickname: accountName(account) });
+      account = result.account; renderAuthHeader(); code = result.code;
+      history.replaceState({}, '', `/?room=${code}`); connect();
+    } catch (error) { notify(error.message); button.disabled = false; button.innerHTML = '링게임 입장하기 <span>→</span>'; }
+  });
+  if ($('#logout-button')) $('#logout-button').onclick = logout;
   $('#entry-form').addEventListener('submit', async event => {
     event.preventDefault();
+    if (!account) { notify('먼저 로그인해 주세요.'); return; }
     const button = $('#entry-button'); button.disabled = true; button.textContent = '테이블에 연결하는 중…';
     try {
       await api('/api/session');
-      const selected = $('#member-select').value;
-      let member;
-      if (selected === '__new__') {
-        const cohort = $('#member-cohort').value.trim(), name = $('#member-name').value.trim();
-        if (!cohort || !name) throw new Error('기수와 이름을 입력해 주세요.');
-        const result = await api('/api/members', { cohort, name });
-        setMembers(result); member = result.member;
-      } else member = members[Number(selected)];
-      if (!member) throw new Error('이름을 선택해 주세요.');
-      nickname = member.name; selectedMemberKey = member.key;
-      renderMemberOptions(); $('#member-select').value = String(members.findIndex(item => item.key === selectedMemberKey));
-      $('#new-member-fields').hidden = true;
-      saveLocal('river-nickname', nickname); saveLocal('river-member-key', selectedMemberKey);
-      const result = await api(code ? `/api/rooms/${code}/join` : '/api/rooms', { nickname, memberKey: selectedMemberKey });
+      const activeTournament = invited ? null : (await api('/api/tournaments/current', undefined, 'GET')).room;
+      const targetCode = invited ? code : activeTournament?.code;
+      const data = {
+        nickname: accountName(account),
+        entryMethod: account.money >= 10000 ? ($('#tournament-entry-method')?.value || 'money') : 'count',
+        ...(!targetCode ? { format: { mode: 'tournament', tournamentSpeed: $('#tournament-speed').value } } : {}),
+      };
+      if (!targetCode) {
+        pendingRoomId ||= crypto.randomUUID().replaceAll('-', '').slice(0, 16);
+        data.id = pendingRoomId;
+      }
+      const result = targetCode ? await api(`/api/rooms/${targetCode}/join`, data) : await api('/api/rooms', data);
+      account = result.account || (await api('/api/auth/me', undefined, 'GET')).account;
+      renderAuthHeader();
+      pendingRoomId = null;
       code = result.code; history.replaceState({}, '', `/?room=${code}`); connect();
-    } catch (error) { notify(error.message); button.disabled = false; button.textContent = $('#member-select').value === '__new__' ? '등록하고 입장하기 →' : invited ? '테이블 입장하기 →' : '새 테이블 만들기 →'; }
+    } catch (error) { notify(error.message); button.disabled = false; button.textContent = entryButtonLabel(); }
   });
-  $('#member-select').addEventListener('change', event => {
-    const registering = event.target.value === '__new__';
-    if (!registering) selectedMemberKey = members[Number(event.target.value)]?.key || selectedMemberKey;
-    $('#new-member-fields').hidden = !registering;
-    $('#entry-button').textContent = registering ? '등록하고 입장하기 →' : (invited ? '테이블 입장하기 →' : '새 테이블 만들기 →');
-  });
-  $('#register-only').addEventListener('click', async () => {
-    const cohort = $('#member-cohort').value.trim(), name = $('#member-name').value.trim();
-    if (!cohort || !name) { notify('기수와 이름을 입력해 주세요.'); return; }
-    const button = $('#register-only'); button.disabled = true;
-    try {
-      await api('/api/session');
-      const result = await api('/api/members', { cohort, name });
-      setMembers(result); selectedMemberKey = result.member.key; nickname = result.member.name;
-      saveLocal('river-nickname', nickname); saveLocal('river-member-key', selectedMemberKey);
-      renderMemberOptions();
-      $('#member-select').value = String(members.findIndex(member => member.key === selectedMemberKey));
-      $('#new-member-fields').hidden = true;
-      $('#entry-button').textContent = invited ? '테이블 입장하기 →' : '새 테이블 만들기 →';
-      await loadLeaderboard();
-      notify('회원 등록을 마쳤어요. 테이블은 나중에 열어도 됩니다.');
-    } catch (error) { notify(error.message); } finally { button.disabled = false; }
-  });
-  renderHomeLeaderboard();
-  renderMemberOptions();
-  loadMembers().catch(error => notify(error.message)).finally(loadLeaderboard);
+  clearInterval(ringLobbyTimer);
+  loadRingLobby();
+  ringLobbyTimer = setInterval(() => { if ($('#ring-lobby-list')) loadRingLobby(); }, 15000);
 }
 function connect() {
   clearTimeout(retryTimer); clearTimeout(replyTimer); clearTimeout(resumeTimer);
@@ -291,31 +250,28 @@ function connect() {
   connected = false; pending = false;
   clearStateQueue();
   if (room) render();
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/rooms/${code}/socket`);
+  const socketPath = code === RING_ROOM_ID ? '/api/ring/socket' : `/api/rooms/${code}/socket`;
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${socketPath}`);
   socket = ws;
-  ws.onmessage = event => {
+  ws.onmessage = async event => {
     if (socket !== ws) return;
     clearTimeout(resumeTimer);
     if (event.data === 'pong') return;
     const data = JSON.parse(event.data);
     if (data.type === 'state') {
-      const savedLedger = ledgerSavePending && data.room.ledger.some(entry =>
-        (ledgerSavePending.recordId ? entry.id === ledgerSavePending.recordId : !ledgerSavePending.previousIds.includes(entry.id)) &&
-        entry.date === ledgerSavePending.date && entry.players.length === ledgerSavePending.players.length &&
-        ledgerSavePending.players.every(player => entry.players.some(saved => saved.id === player.id && saved.rebuys === player.rebuys && saved.finalChips === player.finalChips)));
-      if (savedLedger) { ledgerSavePending = null; ledgerDraft = null; ledgerEditing = null; ledgerFormOpen = false; }
-      else if (!connected) ledgerSavePending = null;
-      latestRoom = data.room; pending = false; connected = true; reconnectAttempt = 0;
+          latestRoom = data.room; pending = false; connected = true; reconnectAttempt = 0;
       clearTimeout(replyTimer);
       saveLocal('river-rooms', JSON.stringify([{ id: latestRoom.id, name: latestRoom.name }, ...recentRooms().filter(r => r.id !== latestRoom.id)].slice(0, 5)));
-      stateQueue.push({ next: data.room, preserve: !savedLedger });
+      stateQueue.push({ next: data.room, preserve: true });
       showNextState();
-    } else if (data.type === 'error') { pending = false; ledgerSavePending = null; clearTimeout(replyTimer); notify(data.error); }
+    } else if (data.type === 'error') { pending = false; clearTimeout(replyTimer); notify(data.error); }
+    else if (data.type === 'account') { account = data.account; renderAuthHeader(); }
     else if (data.type === 'left') {
       clearTimeout(replyTimer); clearTimeout(resumeTimer); clearTimeout(retryTimer);
       ws.onclose = null; ws.close(); socket = null; room = null; code = ''; connected = false; pending = false;
       clearStateQueue(); latestRoom = null;
-      ledgerDraft = null; ledgerSavePending = null; ledgerEditing = null; ledgerFormOpen = false;
+      try { account = (await api('/api/auth/me', undefined, 'GET')).account; } catch { account = null; }
+      renderAuthHeader();
       history.replaceState({}, '', '/'); home();
     }
   };
@@ -329,12 +285,12 @@ function connect() {
 }
 function clearStateQueue() { stateQueue = []; clearTimeout(queueTimer); queueTimer = null; }
 function pacing(prev, next) {
-  if (!prev || reducedMotion.matches || animationSpeed === 'instant' || prev.id !== next.id || prev.hand !== next.hand) return 0;
-  const scale = animationSpeed === 'fast' ? 0.5 : 1;
+  if (!prev || prev.id !== next.id || prev.hand !== next.hand) return 0;
+  if (next.stage === 'finished' && prev.stage !== 'finished') return 3000;
+  if (reducedMotion.matches) return 0;
   const revealed = next.board.length - prev.board.length;
-  if (next.stage === 'finished' && prev.stage !== 'finished') return (2000 + Math.max(0, revealed) * 600) * scale;
-  if (revealed > 0) return (400 + revealed * 600) * scale;
-  return next.players.some(p => p.lastAction && p.lastAction !== prev.players.find(q => q.id === p.id)?.lastAction) ? 700 * scale : 0;
+  if (revealed > 0) return 400 + revealed * 600;
+  return next.players.some(p => p.lastAction && p.lastAction !== prev.players.find(q => q.id === p.id)?.lastAction) ? 700 : 0;
 }
 function showNextState() {
   if (queueTimer || !stateQueue.length) return;
@@ -351,7 +307,7 @@ function confirmAction(action, amount) {
   const legal = room.legal, chips = room.players.find(p => p.id === room.me)?.chips ?? 0;
   if (action === 'fold' && legal?.canCheck) return confirm('지금은 칩을 내지 않고 체크할 수 있어요. 그래도 폴드할까요?');
   const allIn = action === 'call' ? legal?.toCall >= chips : action === 'raise' && amount >= legal?.max;
-  return !allIn || confirm(`남은 칩 ${format(chips)}개를 모두 걸어 올인할까요?`);
+  return !allIn || confirm(`남은 스택 ${tableAmount(chips)}을 모두 걸어 올인할까요?`);
 }
 function checkConnection() {
   if (!code || !room || document.hidden || !navigator.onLine) return;
@@ -365,7 +321,7 @@ function send(type, data = {}) {
   pending = true; socket.send(JSON.stringify({ type, revision: (latestRoom || room).revision, ...data }));
   clearTimeout(replyTimer);
   replyTimer = setTimeout(() => { notify('응답이 늦어 다시 연결합니다. 행동 결과를 확인해 주세요.'); connect(); }, 8000);
-  document.querySelectorAll('[data-send], [data-action], [data-queue], #raise-button, #raise-amount, [data-bet], [data-ledger-save]').forEach(el => { el.disabled = true; });
+  document.querySelectorAll('[data-send], [data-action], [data-queue], #raise-button, #raise-amount, #raise-range, [data-bet]').forEach(el => { el.disabled = true; });
 }
 // Seats sit evenly on an ellipse, starting with this player at the bottom and moving clockwise.
 function seatPosition(index, count) {
@@ -377,13 +333,63 @@ function seatPosition(index, count) {
 function queuePanel(me) {
   const toCall = Math.min(Math.max(0, room.bet - me.bet), me.chips);
   const queued = room.queued;
-  const options = [['checkFold', '체크/폴드'], toCall ? ['call', `콜 ${format(toCall)}`] : ['check', '체크'], ['fold', '폴드']];
+  const options = [['checkFold', '체크/폴드'], toCall ? ['call', `콜 ${tableAmount(toCall)}`] : ['check', '체크'], ['fold', '폴드']];
   const stale = queued?.type === 'call' && queued.cap !== toCall;
   const disabled = connected && !pending ? '' : 'disabled';
   return `<section class="queue-panel" aria-label="내 차례 전에 미리 선택">
     <div class="queue-options">${options.map(([type, label]) => `<button type="button" class="queue-option ${type === 'fold' ? 'queue-fold' : ''}" data-queue="${type}" aria-pressed="${queued?.type === type}" ${disabled}>${label}</button>`).join('')}</div>
     <p class="queue-note" aria-live="polite">${stale ? '콜 금액이 바뀌어 차례가 오면 예약이 취소돼요.' : queued ? '내 차례가 오면 바로 실행돼요. 한 번 더 누르면 취소돼요.' : '미리 골라두면 내 차례에 자동으로 실행되고, 이번 베팅 라운드가 끝나면 사라져요.'}</p>
   </section>`;
+}
+function readSizeRows(container) {
+  return [...container.querySelectorAll('.bet-size-row')].map(row => ({
+    unit: row.querySelector('[data-size-unit]').value,
+    value: Number(row.querySelector('[data-size-value]').value),
+  }));
+}
+function renderBetSizeRows(container, sizes, street) {
+  const title = street === 'preflop' ? '프리플롭' : '플랍 이후';
+  container.innerHTML = sizes.map((size, index) => `<div class="bet-size-row"><span>${index + 1}</span><select data-size-unit aria-label="${title} ${index + 1} 단위"><option value="bb" ${size.unit === 'bb' ? 'selected' : ''}>BB</option><option value="pot" ${size.unit === 'pot' ? 'selected' : ''}>팟 %</option></select><input type="number" data-size-value aria-label="${title} ${index + 1} 값" min="${size.unit === 'bb' ? 0.5 : 1}" max="${size.unit === 'bb' ? 100 : 1000}" step="0.1" value="${size.value}" required>${street === 'postflop' && sizes.length > 4 ? `<button type="button" class="outline remove-bet-size" data-remove-size="${index}" aria-label="${index + 1}번 사이즈 삭제">−</button>` : '<span></span>'}</div>`).join('');
+  container.querySelectorAll('[data-size-unit]').forEach(select => {
+    select.onchange = () => {
+      const input = select.closest('.bet-size-row').querySelector('[data-size-value]');
+      input.min = select.value === 'bb' ? '0.5' : '1';
+      input.max = select.value === 'bb' ? '100' : '1000';
+      if (Number(input.value) < Number(input.min)) input.value = input.min;
+    };
+  });
+  container.querySelectorAll('[data-remove-size]').forEach(button => {
+    button.onclick = () => {
+      const next = readSizeRows(container);
+      if (next.length > 4) next.splice(Number(button.dataset.removeSize), 1);
+      renderBetSizeRows(container, next, street);
+      $('#add-postflop-size').disabled = next.length >= 6;
+    };
+  });
+}
+function openBetSettings() {
+  if (!room) return;
+  const settings = betSizes[room.format.mode];
+  $('#bet-settings-context').textContent = `${room.name} · ${room.format.mode === 'ring' ? '링게임' : '토너먼트'}`;
+  renderBetSizeRows($('#preflop-size-list'), settings.preflop, 'preflop');
+  renderBetSizeRows($('#postflop-size-list'), settings.postflop, 'postflop');
+  $('#add-postflop-size').disabled = settings.postflop.length >= 6;
+  $('#bet-settings').showModal();
+}
+function openBetCalculator() {
+  const input = $('#raise-amount');
+  if (!input || !room?.legal?.canRaise) return;
+  calculatorValue = input.value || String(room.legal.min);
+  $('#bet-calculator-display').textContent = format(calculatorValue);
+  $('#bet-calculator-help').textContent = `${format(room.legal.min)}~${format(room.legal.max)}칩 · 000 버튼으로 천 단위 입력`;
+  $('#bet-calculator').showModal();
+}
+function calculatorKey(key) {
+  const next = key === 'clear' ? '0' : key === 'delete' ? calculatorValue.slice(0, -1) || '0'
+    : `${calculatorValue === '0' ? '' : calculatorValue}${key}`;
+  if (next.length > 15) return;
+  calculatorValue = next.replace(/^0+(?=\d)/, '');
+  $('#bet-calculator-display').textContent = format(calculatorValue);
 }
 function seat(player, index, count) {
   if (!player) return `<div class="seat seat-${index} empty-seat"><span class="empty-avatar">+</span><span>친구의 자리</span></div>`;
@@ -396,88 +402,80 @@ function seat(player, index, count) {
   return `${playing && player.bet > 0 ? `<span class="table-bet" data-seat-pos="${index},${count}" aria-hidden="true"><i></i>${tableAmount(player.bet)}</span>` : ''}<div data-seat-pos="${index},${count}" class="seat seat-${index} ${me ? 'my-seat' : ''} ${room.turn === room.players.indexOf(player) ? 'active-seat' : ''} ${player.folded && player.active ? 'folded' : ''} ${acted ? 'acted' : ''} ${won ? 'winner' : ''} ${won && animFrom ? 'just-won' : ''}">
     <div class="seat-cards">${player.cards.map(c => card(c)).join('')}</div>
     <div class="player-info"><span class="avatar">${escape([...player.name][0])}</span><div><b>${escape(player.name)}${me ? ' <small>나</small>' : ''}</b><span class="chips" title="${format(player.chips)}칩">${tableAmount(player.chips)}</span></div><span class="presence ${player.online ? 'online' : ''}" aria-label="${player.online ? '접속 중' : '연결 끊김'}"></span></div>
-    <div class="player-state">${positions ? `<span class="seat-positions">${positions}</span>` : ''}${playing ? escape(player.lastAction || '') : (player.ready ? '준비 완료 ✓' : '대기 중')}</div>
+    <div class="player-state">${positions ? `<span class="seat-positions">${positions}</span>` : ''}${playing ? escape(player.lastAction || '') : player.chips <= 0 ? (room.format.mode === 'tournament' ? '리엔트리 필요' : '바이인 필요') : player.online ? '자동 참가' : '재접속 대기'}</div>
     ${playing && player.bet > 0 ? `<span class="seat-bet" aria-label="이번 라운드 총 베팅 ${format(player.bet)}칩">베팅 ${tableAmount(player.bet)}</span>` : ''}
   </div>`;
 }
-function readRoomLedgerDraft() {
-  const form = $('[data-ledger-form]');
-  if (!form) return ledgerDraft;
-  return { date: form.querySelector('[data-ledger-date]').value, players: [...form.querySelectorAll('[data-ledger-row]')].map(row => ({
-    id: row.dataset.ledgerRow, selected: row.querySelector('[data-ledger-player]')?.checked ?? true,
-    rebuys: row.querySelector('[data-rebuys]').value, finalChips: row.querySelector('[data-final]').value,
-  })) };
-}
-function render(preserveLedgerDraft = true) {
-  if (preserveLedgerDraft) ledgerDraft = readRoomLedgerDraft();
+function render() {
+  if ($('#bet-calculator')?.open && !room.legal?.canRaise) $('#bet-calculator').close();
   const focused = app.contains(document.activeElement) ? document.activeElement : null;
   const focusKey = focused?.id ? `#${focused.id}` : focused?.dataset.panel ? `[data-panel="${focused.dataset.panel}"]` : focused?.dataset.send ? `[data-send="${focused.dataset.send}"]` : focused?.dataset.action ? `[data-action="${focused.dataset.action}"]` : focused?.dataset.bet ? `[data-bet="${focused.dataset.bet}"]` : null;
   const turnKey = `${room.hand}:${room.stage}:${room.turn}:${room.bet}`;
   const previousAmount = renderedTurn === turnKey ? $('#raise-amount')?.value ?? null : null;
-  const preferencesOpen = $('#display-preferences')?.open ?? false;
   if (panel === 'history') openHands = new Set([...document.querySelectorAll('details.history-entry[open]')].map(d => d.dataset.hand));
   renderedTurn = turnKey;
-  app.className = `game${fourColour ? ' four-colour' : ''}`;
-  app.dataset.animation = animationSpeed;
+  app.className = 'game';
   document.body.classList.add('in-game');
   const me = room.players.find(p => p.id === room.me);
   const idle = ['waiting', 'finished'].includes(room.stage);
-  const host = room.hostId === room.me;
+  const ring = room.format.mode === 'ring';
+  const tournament = room.format.mode === 'tournament';
+  const champion = tournament ? room.players.find(player => player.id === room.tournament.winnerId) : null;
+  const tournamentLevelLabel = tournament && room.tournament.activeLevel !== room.tournament.level
+    ? `핸드 레벨 ${room.tournament.activeLevel} · 다음 ${room.tournament.level}` : `레벨 ${room.tournament?.activeLevel || 1}`;
   const legal = room.legal;
-  const canQueue = showQueue && me?.active && !me.folded && me.chips > 0;
+  const canQueue = me?.active && !me.folded && me.chips > 0;
   // Rotate seats so this player is always at the bottom of the table.
   const ownIndex = room.players.findIndex(p => p.id === room.me);
   const ordered = ownIndex >= 0 ? [...room.players.slice(ownIndex), ...room.players.slice(0, ownIndex)] : room.players;
   const disabled = connected && !pending ? '' : 'disabled';
-  app.innerHTML = `<section class="table-heading"><div><div class="eyebrow"><span class="connection ${connected ? '' : 'disconnected'}">${connected ? '실시간 연결됨' : '다시 연결하는 중…'}</span></div><h1>${escape(room.name)}</h1></div><div class="table-tools"><button class="outline" id="invite-button" aria-haspopup="dialog">친구 초대 <span>↗</span></button><button class="quiet" data-send="leave" ${!idle ? 'disabled' : disabled} title="핸드가 끝난 뒤 나갈 수 있어요">나가기</button></div></section>
-    <details id="display-preferences" class="display-preferences"><summary id="display-preferences-summary">화면 설정</summary><section class="display-options" aria-label="플레이 화면 설정"><label><input type="checkbox" id="show-bb" ${showBB ? 'checked' : ''}> BB 단위로 보기</label><label><input type="checkbox" id="four-colour" ${fourColour ? 'checked' : ''}> 4색 카드</label><label><input type="checkbox" id="show-queue" ${showQueue ? 'checked' : ''}> 미리 선택 버튼</label><label for="animation-speed">애니메이션 <select id="animation-speed">${[['normal', '보통'], ['fast', '빠르게'], ['instant', '즉시']].map(([value, label]) => `<option value="${value}" ${animationSpeed === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label></section><p>1 BB = ${format(room.bigBlind)}칩 · 베팅 입력과 행동 버튼은 항상 칩 단위예요. 설정은 이 브라우저에 저장돼요.</p></details>
-    <div class="game-layout"><section class="play-area"><div class="table-meta"><span>블라인드 <b>${room.smallBlind} / ${room.bigBlind}</b></span><span>핸드 <b>${String(room.hand).padStart(2, '0')}</b></span></div>
+  const lobbyTitle = champion ? `${escape(champion.name)} 님이 토너먼트에서 우승했습니다.` : room.stage === 'finished' ? room.result.map(r => `${escape(r.name)} +${tableAmount(r.amount)}`).join(' / ') : '2명 이상 접속하면 자동 시작해요';
+  const lobbyDetail = champion ? '토너먼트 종료' : room.stage === 'finished' ? room.result.map(r => r.handName).join(' / ') + (room.nextHandAt ? ' — 다음 핸드가 자동으로 시작돼요.' : ' — 참가자가 모이면 자동으로 시작돼요.') : '준비 버튼 없이 온라인 참가자가 모이면 바로 진행합니다.';
+  const tournamentReentry = tournament && me?.chips === 0 && !champion
+    ? me.entries > room.tournament.maxReentries ? '<p class="form-note">리엔트리 횟수 2회를 모두 사용했습니다.</p>'
+      : room.tournament.registrationOpen ? `<label class="tournament-entry-select">리엔트리 방식<select data-tournament-entry-method><option value="money" ${account?.money < 10000 ? 'disabled' : ''}>개인 머니 10,000 사용</option><option value="count" ${account?.money >= 10000 ? 'disabled' : ''}>바이인 횟수 +1</option></select></label><button class="primary" data-send="rebuy" ${disabled}>리엔트리 · 10,000칩</button>`
+      : '<p class="form-note">시작 스택이 5BB 미만이라 리엔트리가 마감됐습니다.</p>' : '';
+  const lobbyActions = `${ring && me?.chips <= 5000 ? `<button class="primary" data-send="rebuy" ${disabled}>추가 바이인 · 10,000칩으로 재설정</button>` : ''}${tournamentReentry}`;
+  const currentBetSizes = betSizes[room.format.mode][room.stage === 'preflop' ? 'preflop' : 'postflop'];
+  app.innerHTML = `<section class="table-heading"><div><div class="eyebrow"><span class="connection ${connected ? '' : 'disconnected'}">${connected ? '실시간 연결됨' : '다시 연결하는 중…'}</span></div><h1>${escape(room.name)}</h1></div><div class="table-tools"><button class="outline" id="invite-button" aria-haspopup="dialog">친구 초대 <span>↗</span></button>${tournament ? '' : `<button class="quiet" data-send="leave" ${!idle ? 'disabled' : disabled} title="핸드가 끝난 뒤 나갈 수 있어요">나가기</button>`}</div></section>
+    <div class="game-layout"><section class="play-area"><div class="table-meta"><span>블라인드 <b>${tableAmount(room.smallBlind)} / ${tableAmount(room.bigBlind)}</b></span>${tournament ? `<span>${tournamentLevelLabel} · 앤티 <b>${tableAmount(room.ante)}</b> · ${room.format.tournamentSpeed === 'turbo' ? '터보' : '기본'}</span><span id="tournament-countdown" role="timer" aria-live="off"></span>` : ''}<span>핸드 <b>${String(room.hand).padStart(2, '0')}</b></span><button type="button" class="unit-toggle" id="unit-toggle" aria-pressed="${displayUnit === 'bb'}" aria-label="표시 단위를 변경합니다. 현재 ${displayUnit === 'bb' ? 'BB' : '칩'}">단위: ${displayUnit === 'bb' ? 'BB' : '칩'} ⇄</button><button type="button" class="bet-settings-button" id="bet-settings-button">사이즈 설정</button></div>
       <div class="poker-surface"><div class="felt"><div class="felt-border"></div><span class="felt-wordmark">RIVER</span></div>
-        <div class="board-area"><div class="round-label">${stages[room.stage]}</div>${idle && room.stage === 'waiting' ? '<div class="waiting-title">자리가 준비됐어요.</div><p class="waiting-description">초대 링크를 보내고<br>친구와 함께 준비를 눌러주세요.</p>' : `<div class="pot-label">TOTAL POT <strong title="${format(room.pot)}칩">${tableAmount(room.pot)}</strong></div><div class="board-cards">${Array.from({ length: 5 }, (_, i) => card(room.board[i], animFrom && i >= animFrom.board.length ? `reveal reveal-${i - animFrom.board.length}` : '')).join('')}</div>`}</div>
+        <div class="board-area"><div class="round-label">${stages[room.stage]}</div>${idle && room.stage === 'waiting' ? '<div class="waiting-title">자리가 준비됐어요.</div><p class="waiting-description">2명 이상 접속하면<br>첫 핸드가 자동으로 시작돼요.</p>' : `<div class="pot-label">TOTAL POT <strong title="${format(room.pot)}칩">${tableAmount(room.pot)}</strong></div><div class="board-cards">${Array.from({ length: 5 }, (_, i) => card(room.board[i], animFrom && i >= animFrom.board.length ? `reveal reveal-${i - animFrom.board.length}` : '')).join('')}</div>`}</div>
         ${ordered.map((player, i) => seat(player, i, ordered.length)).join('')}
       </div>
-      <section class="action-panel" aria-label="게임 행동">${idle ? `<div class="turn-info"><span class="turn-dot"></span><div><b>${room.stage === 'finished' ? room.result.map(r => `${escape(r.name)} +${format(r.amount)}`).join(' / ') : '친구가 모이면 시작해요'}</b><span>${room.stage === 'finished' ? room.result.map(r => escape(r.handName)).join(' / ') + ' — 다음 핸드를 위해 준비를 눌러주세요.' : `${room.players.filter(p => p.ready).length}명 준비 완료 / 최소 2명 필요`}</span></div></div><div class="lobby-actions">${me?.chips === 0 ? `<button class="primary" data-send="rebuy" ${disabled}>가상 칩 ${format(room.chipUnit)} 충전</button>` : `<button class="${me?.ready ? 'outline' : 'primary'}" data-send="ready" ${disabled}>${me?.ready ? '준비 취소' : '준비하기'}</button>`}${host ? `<button class="primary gold" data-send="start" ${room.players.filter(p => p.ready && p.online).length < 2 ? 'disabled' : disabled}>${room.hand ? '다음 핸드' : '첫 핸드 시작'} →</button>` : !room.players.find(p => p.id === room.hostId)?.online ? `<button class="outline" data-send="claimHost" ${disabled}>방장 맡기</button>` : '<span class="waiting-host">방장이 핸드를 시작해요</span>'}</div>` : `<div class="turn-info"><span class="turn-dot ${legal ? 'your-turn' : ''}"></span><div><b>${legal ? '내 차례예요.' : `${escape(room.players[room.turn]?.name || '')} 님의 차례`}</b><span>${legal ? '어떤 플레이를 할까요?' : '다음 수를 생각해 보세요.'}</span></div><span class="timer" id="countdown"></span></div>${!legal && canQueue ? queuePanel(me) : `<div class="betting-actions"><button class="fold-button" data-action="fold" ${legal ? disabled : 'disabled'}>폴드</button><button class="primary" data-action="${legal?.canCheck ? 'check' : 'call'}" ${legal ? disabled : 'disabled'}>${!legal ? '콜' : legal.canCheck ? '체크' : `콜 ${format(legal.toCall)}칩`}</button><div class="raise-control"><label for="raise-amount">총 베팅액 (칩)</label><input id="raise-amount" type="number" inputmode="numeric" aria-describedby="raise-preview raise-help" required min="${legal?.min || 0}" max="${legal?.max || 0}" step="1" value="${legal?.min || 0}" ${legal?.canRaise ? disabled : 'disabled'}></div><button class="primary gold" id="raise-button" ${legal?.canRaise ? disabled : 'disabled'}>레이즈 ↑</button></div>${legal?.canRaise ? `<output id="raise-preview" class="raise-preview" for="raise-amount" aria-live="polite"></output><section class="quick-bets" aria-label="베팅 금액 빠른 선택">${raisePresets(room, legal).map((preset, index) => `<button type="button" id="bet-preset-${index}" data-bet="${preset.amount}" ${disabled} title="이번 라운드 총액 ${format(preset.amount)}칩">${preset.label} <b>${format(preset.amount)}</b></button>`).join('')}</section><p id="raise-help" class="raise-help">총액에는 이미 낸 칩이 포함돼요. ½ 팟·팟은 콜을 마친 뒤의 팟을 기준으로 올리며, 가능한 범위 안에서 선택돼요. Enter로 확인 · Esc로 최소 금액 복귀</p>` : ''}`}`}</section>
-      <p class="table-footnote">${format(room.chipUnit)} 가상 칩으로 시작 / 블라인드 ${format(room.smallBlind)} / ${format(room.bigBlind)} / 행동 시간 45초 / 결제 및 환전 없음</p>${projectLinks}
-    </section><aside class="sidebar"><div class="side-tabs" role="tablist" aria-label="테이블 정보"><button role="tab" id="tab-ranking" aria-controls="side-content" tabindex="${panel === 'ranking' ? 0 : -1}" aria-selected="${panel === 'ranking'}" data-panel="ranking">리더보드</button><button role="tab" id="tab-history" aria-controls="side-content" tabindex="${panel === 'history' ? 0 : -1}" aria-selected="${panel === 'history'}" data-panel="history">핸드 기록</button><button role="tab" id="tab-ledger" aria-controls="side-content" tabindex="${panel === 'ledger' ? 0 : -1}" aria-selected="${panel === 'ledger'}" data-panel="ledger">주간 기록</button><button role="tab" id="tab-log" aria-controls="side-content" tabindex="${panel === 'log' ? 0 : -1}" aria-selected="${panel === 'log'}" data-panel="log">진행 로그</button></div><div id="side-content" role="tabpanel" tabindex="0" aria-labelledby="tab-${panel}">${sideContent()}</div></aside></div>`;
-  $('#display-preferences').open = preferencesOpen;
+      <section class="action-panel" aria-label="게임 행동">${idle ? `<div class="turn-info"><span class="turn-dot"></span><div><b>${lobbyTitle}</b><span>${lobbyDetail}</span></div><span class="timer" id="next-hand-countdown" role="timer" aria-live="off"></span></div><div class="lobby-actions">${lobbyActions}</div>` : `<div class="turn-info"><span class="turn-dot ${legal ? 'your-turn' : ''}"></span><div><b>${legal ? '내 차례예요.' : `${escape(room.players[room.turn]?.name || '')} 님의 차례`}</b><span>${legal ? '어떤 플레이를 할까요?' : '다음 수를 생각해 보세요.'}</span></div><span class="timer" id="countdown"></span></div>${!legal && canQueue ? queuePanel(me) : `<div class="betting-actions"><button class="fold-button" data-action="fold" ${legal ? disabled : 'disabled'}>폴드</button><button class="primary" data-action="${legal?.canCheck ? 'check' : 'call'}" ${legal ? disabled : 'disabled'}>${!legal ? '콜' : legal.canCheck ? '체크' : `콜 ${tableAmount(legal.toCall)}`}</button><div class="raise-control"><label for="raise-amount">총 베팅액 (칩)</label><div class="raise-entry"><input id="raise-amount" type="number" inputmode="numeric" aria-describedby="raise-preview raise-help" required min="${legal?.min || 0}" max="${legal?.max || 0}" step="1" value="${legal?.min || 0}" ${legal?.canRaise ? disabled : 'disabled'}><button type="button" class="outline" id="bet-calculator-open" aria-label="숫자 계산기로 베팅 금액 입력" ${legal?.canRaise ? disabled : 'disabled'}>계산기</button></div></div><button class="primary gold" id="raise-button" ${legal?.canRaise ? disabled : 'disabled'}>레이즈 ↑</button></div>${legal?.canRaise ? `<div class="raise-range"><label for="raise-range">레이즈 범위 <output id="raise-range-value">${tableAmount(legal.min)}</output></label><input id="raise-range" type="range" aria-describedby="raise-preview raise-help" min="${legal.min}" max="${legal.max}" step="1" value="${legal.min}" ${disabled}><div class="raise-limits"><span>최소 ${tableAmount(legal.min)}</span><span>올인 ${tableAmount(legal.max)}</span></div></div><div class="bet-sizing-heading"><b>${room.stage === 'preflop' ? '프리플롭' : '플랍 이후'} 빠른 사이즈</b><span>설정에서 직접 편집</span></div><section class="quick-bets" aria-label="베팅 금액 빠른 선택">${raisePresets(room, legal, currentBetSizes).map((preset, index) => `<button type="button" id="bet-preset-${index}" data-bet="${preset.amount}" ${disabled} title="이번 라운드 총액 ${format(preset.amount)}칩">${preset.label} <b>${tableAmount(preset.amount)}</b></button>`).join('')}<button type="button" class="all-in-bet" data-bet="${legal.max}" ${disabled} title="올인 ${format(legal.max)}칩">올인 <b>${tableAmount(legal.max)}</b></button></section><output id="raise-preview" class="raise-preview" for="raise-amount" aria-live="polite"></output><p id="raise-help" class="raise-help">슬라이더는 드래그로 1칩씩, 휠로 1BB씩 조절해요. 프리셋은 BB 또는 팟 비율로 계산하고, 계산기는 칩 단위로 입력해요.</p>` : ''}`}`}</section>
+      <p class="table-footnote">${tournament ? `9-max 토너먼트 · 시작 칩 10,000 · 리엔트리 최대 2회 · ${room.format.tournamentSpeed === 'turbo' ? '레벨 3분' : '레벨 6분'} · 앤티 포함` : '핸드 종료 후 남은 개인 머니를 10,000칩까지 자동 보충 · 5,000칩 이하에서 추가 바이인 가능'} / 블라인드 ${tableAmount(room.smallBlind)} / ${tableAmount(room.bigBlind)} / 행동 시간 ${room.format.turnTimeoutMs / 1000}초 / 결제 및 환전 없음</p>
+    </section><aside class="sidebar"><div class="side-tabs" role="tablist" aria-label="테이블 정보"><button role="tab" id="tab-history" aria-controls="side-content" tabindex="${panel === 'history' ? 0 : -1}" aria-selected="${panel === 'history'}" data-panel="history">핸드 기록</button><button role="tab" id="tab-log" aria-controls="side-content" tabindex="${panel === 'log' ? 0 : -1}" aria-selected="${panel === 'log'}" data-panel="log">진행 로그</button></div><div id="side-content" role="tabpanel" tabindex="0" aria-labelledby="tab-${panel}">${sideContent()}</div></aside></div>`;
   // The CSP forbids inline style attributes, so seat coordinates are applied through the CSSOM.
   document.querySelectorAll('[data-seat-pos]').forEach(el => {
     const [index, count] = el.dataset.seatPos.split(',').map(Number);
     for (const [name, value] of Object.entries(seatPosition(index, count))) el.style.setProperty(name, value);
   });
-  $('#show-bb').onchange = event => { showBB = event.target.checked; saveLocal('river-show-bb', String(showBB)); render(); };
-  $('#four-colour').onchange = event => { fourColour = event.target.checked; saveLocal('river-four-colour', String(fourColour)); render(); };
-  $('#show-queue').onchange = event => { showQueue = event.target.checked; saveLocal('river-show-queue', String(showQueue)); render(); };
   document.querySelectorAll('[data-queue]').forEach(button => {
     button.onclick = () => send('queue', { queue: room.queued?.type === button.dataset.queue ? null : { type: button.dataset.queue } });
   });
-  $('#animation-speed').onchange = event => {
-    animationSpeed = event.target.value; saveLocal('river-animation-speed', animationSpeed);
-    clearTimeout(queueTimer); queueTimer = null;
-    if (stateQueue.length) showNextState(); else render();
-  };
-  const ledgerForm = $('[data-ledger-form]');
-  if (ledgerDraft && ledgerForm) {
-    ledgerForm.querySelector('[data-ledger-date]').value = ledgerDraft.date;
-    ledgerForm.querySelectorAll('[data-ledger-row]').forEach(row => {
-      const saved = ledgerDraft.players.find(player => player.id === row.dataset.ledgerRow);
-      const checkbox = row.querySelector('[data-ledger-player]');
-      if (checkbox) checkbox.checked = saved?.selected ?? false;
-      if (saved) { row.querySelector('[data-rebuys]').value = saved.rebuys; row.querySelector('[data-final]').value = saved.finalChips; }
-    });
-  }
   $('#invite-button').onclick = () => {
     $('#invite-link').value = `${location.origin}/?room=${room.id}`;
     $('#invite-feedback').textContent = '';
     $('#share-invite').hidden = !navigator.share;
     $('#invite').showModal();
   };
-  document.querySelectorAll('[data-send]').forEach(button => { button.onclick = () => send(button.dataset.send); });
+  $('#unit-toggle').onclick = () => {
+    displayUnit = displayUnit === 'chips' ? 'bb' : 'chips';
+    saveLocal('river-chip-unit', displayUnit);
+    render();
+  };
+  $('#bet-settings-button').onclick = openBetSettings;
+  $('#bet-calculator-open')?.addEventListener('click', openBetCalculator);
+  document.querySelectorAll('[data-send]').forEach(button => { button.onclick = () => {
+    const entryMethod = room.format.mode === 'tournament' && button.dataset.send === 'rebuy' ? $('[data-tournament-entry-method]')?.value || 'money' : null;
+    send(button.dataset.send, entryMethod ? { entryMethod } : {});
+  }; });
   document.querySelectorAll('[data-action]').forEach(button => { button.onclick = () => { if (confirmAction(button.dataset.action)) send('action', { action: button.dataset.action }); }; });
   document.querySelectorAll('[data-panel]').forEach(button => {
-    button.onclick = () => { panel = button.dataset.panel; ledgerEditing = null; ledgerFormOpen = false; ledgerDraft = null; render(false); };
+    button.onclick = () => { panel = button.dataset.panel; render(); };
     button.onkeydown = event => {
-      const keys = ['ranking', 'history', 'ledger', 'log'];
+      const keys = ['history', 'log'];
       if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault();
       const index = keys.indexOf(panel);
@@ -485,38 +483,31 @@ function render(preserveLedgerDraft = true) {
       render(); $(`#tab-${panel}`).focus({ preventScroll: true });
     };
   });
-  $('#ledger-new')?.addEventListener('click', () => { ledgerFormOpen = !ledgerFormOpen; ledgerEditing = null; ledgerDraft = null; render(false); });
-  document.querySelectorAll('[data-ledger-edit]').forEach(button => { button.onclick = () => { ledgerEditing = button.dataset.ledgerEdit; ledgerFormOpen = false; ledgerDraft = null; render(false); }; });
-  document.querySelectorAll('[data-ledger-cancel]').forEach(button => { button.onclick = () => { ledgerEditing = null; ledgerFormOpen = false; ledgerDraft = null; render(false); }; });
-  document.querySelectorAll('[data-ledger-save]').forEach(button => {
-    button.onclick = () => {
-      if (ledgerSavePending) return;
-      const form = button.closest('[data-ledger-form]');
-      if (![...form.querySelectorAll('input')].every(input => input.reportValidity())) return;
-      const players = [...form.querySelectorAll('[data-ledger-row]')].filter(row => !row.querySelector('[data-ledger-player]') || row.querySelector('[data-ledger-player]').checked).map(row => ({ id: row.dataset.ledgerRow, rebuys: Number(row.querySelector('[data-rebuys]').value), finalChips: Number(row.querySelector('[data-final]').value) }));
-      const data = { recordId: button.dataset.ledgerSave || undefined, date: form.querySelector('[data-ledger-date]').value, players };
-      ledgerDraft = readRoomLedgerDraft();
-      ledgerSavePending = { ...data, previousIds: room.ledger.map(entry => entry.id) };
-      send('ledgerSave', data);
-    };
-  });
-  document.querySelectorAll('[data-ledger-delete]').forEach(button => { button.onclick = () => { if (confirm('이 세션 기록을 삭제할까요? 삭제하면 되돌릴 수 없습니다.')) send('ledgerDelete', { recordId: button.dataset.ledgerDelete }); }; });
-  $('#ledger-export')?.addEventListener('click', () => {
-    const blob = new Blob([JSON.stringify({ version: 1, room: room.name, exportedAt: new Date().toISOString(), sessions: room.ledger }, null, 2)], { type: 'application/json' });
-    const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `river-chip-ledger-${room.id}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-  });
   if (legal?.canRaise) {
     const input = $('#raise-amount'), preview = $('#raise-preview');
+    const range = $('#raise-range'), rangeValue = $('#raise-range-value');
     if (previousAmount !== null) input.value = previousAmount;
     const updatePreview = () => {
       const result = raisePreview(input.value, me, legal, room.bigBlind);
       input.setAttribute('aria-invalid', String(!result));
       preview.classList.toggle('invalid', !result);
       if (!result) preview.textContent = `${format(legal.min)}~${format(legal.max)} 사이의 정수 칩을 입력해 주세요.`;
-      else preview.innerHTML = `<span>추가 투입 <b>${format(result.additional)}</b></span><span>남은 칩 <b>${format(result.remaining)}</b></span><span>총액 <b>${result.bigBlinds.toLocaleString('ko-KR', { maximumFractionDigits: 2 })} BB</b></span>`;
+      else {
+        range.value = input.value;
+        rangeValue.textContent = tableAmount(input.value);
+        preview.innerHTML = `<span>추가 투입 <b>${tableAmount(result.additional)}</b></span><span>남은 스택 <b>${tableAmount(result.remaining)}</b></span><span>총액 <b>${result.bigBlinds.toLocaleString('ko-KR', { maximumFractionDigits: 2 })} BB</b></span>`;
+      }
       return result;
     };
     input.oninput = updatePreview;
+    range.oninput = () => { input.value = range.value; updatePreview(); };
+    range.onwheel = event => {
+      if (!connected || pending || range.disabled) return;
+      event.preventDefault();
+      range.value = String(Math.max(legal.min, Math.min(legal.max, Number(range.value) + (event.deltaY < 0 ? 1 : -1) * room.bigBlind)));
+      input.value = range.value;
+      updatePreview();
+    };
     document.querySelectorAll('[data-bet]').forEach(button => {
       button.onclick = () => {
         if (!connected || pending || input.disabled) return;
@@ -556,20 +547,20 @@ function historyEntry(h) {
 }
 function sideContent() {
   if (panel === 'log') return `<div class="section-caption">지금까지의 플레이</div><ol class="game-log">${room.log.map(item => `<li>${escape(item)}</li>`).join('')}</ol>`;
-  if (panel === 'history') return `<div class="section-caption">최근 50개 핸드</div>${room.history.length ? room.history.map(historyEntry).join('') : '<div class="empty-state"><span>↺</span><b>첫 핸드를 기다리고 있어요</b><p>완료된 핸드의 결과가 여기에 남아요.</p></div>'}`;
-  if (panel === 'ledger') return ledgerContent();
-  return `<div class="section-caption"><span>이 테이블의 누적 순이익</span><span>가상 칩</span></div><ol class="leaderboard">${room.ranking.map((p, i) => `<li><span class="rank-no">${String(i + 1).padStart(2, '0')}</span><span class="rank-name"><b>${escape(p.name)}${p.id === room.me ? ' <small>나</small>' : ''}</b><small>${p.hands}핸드 / ${p.wins}승</small></span><strong class="${p.net < 0 ? 'negative' : ''}">${p.net > 0 ? '+' : ''}${format(p.net)}</strong></li>`).join('')}</ol><p class="ranking-note">정산된 칩 순이익 순으로 정렬해요. 충전한 칩은 순이익에 포함하지 않으며, 팟을 나눠 가져도 승수에 포함합니다.</p>${!room.ranking.some(p => p.hands) ? '<div class="empty-state"><span>♠</span><b>첫 승의 주인공은 누구일까요?</b><p>첫 핸드가 끝나면 전적이 기록돼요.</p></div>' : ''}`;
+  return `<div class="section-caption">최근 50개 핸드</div>${room.history.length ? room.history.map(historyEntry).join('') : '<div class="empty-state"><span>↺</span><b>첫 핸드를 기다리고 있어요</b><p>완료된 핸드의 결과가 여기에 남아요.</p></div>'}`;
 }
-function ledgerContent() {
-  const host = room.hostId === room.me;
-  const idle = ['waiting', 'finished'].includes(room.stage);
-  const today = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const fields = (players, selectable = false) => players.map(p => `<div class="ledger-player" data-ledger-row="${escape(p.id)}"><label>${selectable ? `<input type="checkbox" data-ledger-player="${escape(p.id)}" checked>` : ''}<b>${escape(p.name)}</b></label><label>리바인<input type="number" min="0" max="100" step="1" value="${selectable ? 0 : p.rebuys}" data-rebuys required></label><label>종료 칩<input type="number" min="0" max="100000000" step="1" value="${selectable ? room.chipUnit : p.finalChips}" data-final required></label></div>`).join('');
-  const form = (players, recordId = '') => `<div class="ledger-form" data-ledger-form><label>게임 날짜<input type="date" data-ledger-date value="${recordId ? escape(room.ledger.find(e => e.id === recordId).date) : today}" required></label>${fields(players, !recordId)}<div class="ledger-actions"><button class="primary" data-ledger-save="${escape(recordId)}" ${!host || !idle || !connected || pending ? 'disabled' : ''}>기록 저장</button><button class="outline" data-ledger-cancel>취소</button></div></div>`;
-  const net = (entry, p) => p.finalChips - (entry.startChips ?? 30000) * (p.rebuys + 1);
-  return `<div class="ledger-tools"><button id="ledger-new" class="primary" ${!host || !idle || !connected || pending ? 'disabled' : ''}>새 게임 기록</button><button id="ledger-export" class="outline" ${room.ledger.length ? '' : 'disabled'}>백업 다운로드</button></div><p class="ranking-note">이 테이블은 참가자마다 ${format(room.chipUnit)}칩으로 시작하며 리바인 1회도 ${format(room.chipUnit)}칩으로 계산합니다. 이전 기록은 저장할 때의 시작 칩 기준을 그대로 써요. 게임이 끝난 뒤 각자의 리바인 횟수와 종료 칩을 입력하세요. 새 기록과 수정·삭제는 접속 중인 방장만 할 수 있습니다.</p>${ledgerFormOpen && host ? form(room.players) : ''}<div class="section-caption"><span>주간 우승 / 누적 순이익</span><span>누적 종료 칩</span></div><ol class="leaderboard">${room.ledgerRanking.map((p, i) => `<li><span class="rank-no">${String(i + 1).padStart(2, '0')}</span><span class="rank-name"><b>${escape(p.name)}${p.id === room.me ? ' <small>나</small>' : ''}</b><small>이번 주 ${p.weeklyWins}회 우승 / 순이익 ${p.net > 0 ? '+' : ''}${format(p.net)}</small></span><strong>${format(p.finalChips)}</strong></li>`).join('')}</ol>${room.ledger.length ? [...room.ledger].sort((a, b) => b.at - a.at).map(entry => `<article class="ledger-entry"><header><b>${escape(entry.date)} 세션</b><span>${entry.players.length}명</span></header>${entry.players.map(p => `<p>${escape(p.name)} <span>리바인 ${p.rebuys}회 / 종료 ${format(p.finalChips)}칩 / 순이익 <strong class="${net(entry, p) < 0 ? 'negative' : ''}">${net(entry, p) > 0 ? '+' : ''}${format(net(entry, p))}</strong></span></p>`).join('')}${ledgerEditing === entry.id ? form(entry.players, entry.id) : `<div class="ledger-actions"><button class="outline" data-ledger-edit="${escape(entry.id)}" ${!host || !idle ? 'disabled' : ''}>수정</button><button class="quiet" data-ledger-delete="${escape(entry.id)}" ${!host || !idle || !connected || pending ? 'disabled' : ''}>삭제</button></div>`}</article>`).join('') : '<div class="empty-state"><span>♧</span><b>아직 게임 기록이 없어요</b><p>게임이 끝나면 방장이 새 기록을 추가할 수 있어요.</p></div>'}<p class="ranking-note">백업 파일에는 이 테이블의 세션 날짜, 닉네임, 리바인 횟수와 종료 칩이 담깁니다.</p>`;
+function countdown() {
+  const now = Date.now();
+  const action = $('#countdown');
+  if (action && room?.deadline) action.textContent = `${Math.max(0, Math.ceil((room.deadline - now) / 1000))}초`;
+  const nextHand = $('#next-hand-countdown');
+  if (nextHand) nextHand.textContent = room?.nextHandAt ? `${Math.max(0, Math.ceil((room.nextHandAt - now) / 1000))}초` : '';
+  const level = $('#tournament-countdown');
+  if (level && room?.tournament) {
+    const seconds = Math.max(0, Math.ceil(((room.tournament.nextLevelAt || now) - now) / 1000));
+    level.textContent = room.tournament.winnerId ? '토너먼트 종료' : room.tournament.startedAt == null ? '첫 핸드부터 시작' : room.tournament.nextLevelAt ? `레벨업 ${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}` : '마지막 레벨';
+  }
 }
-function countdown() { const el = $('#countdown'); if (el && room?.deadline) el.textContent = `${Math.max(0, Math.ceil((room.deadline - Date.now()) / 1000))}초`; }
 setInterval(countdown, 1000);
 setInterval(checkConnection, 25000);
 document.addEventListener('visibilitychange', checkConnection);
@@ -590,40 +581,51 @@ $('#share-invite').onclick = async () => {
   catch (error) { if (error.name !== 'AbortError') $('#invite-feedback').textContent = '공유 메뉴를 열지 못했어요. 링크 복사를 이용해 주세요.'; }
 };
 $('#invite').addEventListener('close', () => $('#invite-button')?.focus({ preventScroll: true }));
-$('#close-member-management').onclick = () => $('#member-management').close();
-$('#member-management').addEventListener('close', () => { memberDeleteTarget = null; renderMemberManager(); $('#manage-members')?.focus({ preventScroll: true }); });
-$('#member-management-list').addEventListener('click', event => {
-  const button = event.target.closest('[data-member-delete]');
-  if (!button || memberDeleting) return;
-  memberDeleteTarget = members.find(item => item.key === button.dataset.memberDelete);
-  if (!memberDeleteTarget) return;
-  renderMemberManager(); $('#cancel-member-delete').focus();
-});
-$('#cancel-member-delete').onclick = () => { memberDeleteTarget = null; renderMemberManager(); $('#close-member-management').focus(); };
-$('#confirm-member-delete').onclick = async () => {
-  const member = memberDeleteTarget;
-  if (!member || memberDeleting) return;
-  if (manualSaving) { $('#member-management-error').textContent = '기록 저장이 끝난 뒤 다시 시도해 주세요.'; return; }
-  memberDeleting = true;
-  $('#member-management-error').textContent = '';
-  renderMemberManager();
-  try {
-    await api('/api/session');
-    const result = await api('/api/members', { memberKey: member.key }, 'DELETE');
-    manualDraft = readManualDraft();
-    setMembers(result);
-    if (selectedMemberKey === member.key) {
-      selectedMemberKey = members[0]?.key || ''; nickname = members[0]?.name || '';
-      saveLocal('river-member-key', selectedMemberKey); saveLocal('river-nickname', nickname);
-    }
-    renderMemberOptions();
-    await loadLeaderboard();
-    memberDeleteTarget = null;
-    notify(`${memberLabel(member)} 멤버를 삭제했어요. 기존 게임 기록은 유지됩니다.`);
-  } catch (error) { $('#member-management-error').textContent = error.message; }
-  finally { memberDeleting = false; renderMemberManager(); $('#close-member-management').focus(); }
+$('#close-bet-settings').onclick = () => $('#bet-settings').close();
+$('#add-postflop-size').onclick = () => {
+  const sizes = readSizeRows($('#postflop-size-list'));
+  if (sizes.length >= 6) return;
+  sizes.push({ unit: 'pot', value: sizes.length === 4 ? 125 : 150 });
+  renderBetSizeRows($('#postflop-size-list'), sizes, 'postflop');
+  $('#add-postflop-size').disabled = sizes.length >= 6;
 };
-home();
-if (code && nickname && recentRooms().some(r => r.id === code)) {
-  (async () => { try { await api('/api/session'); await api(`/api/rooms/${code}/join`, { nickname }); connect(); } catch (error) { notify(error.message); } })();
-}
+$('#bet-settings-form').onsubmit = event => {
+  event.preventDefault();
+  const preflop = readSizeRows($('#preflop-size-list'));
+  const postflop = readSizeRows($('#postflop-size-list'));
+  if (!event.currentTarget.reportValidity() || preflop.length !== 4 || postflop.length < 4 || postflop.length > 6 || ![...preflop, ...postflop].every(validSize)) return;
+  betSizes[room.format.mode] = { preflop, postflop };
+  saveLocal('river-bet-sizes', JSON.stringify(betSizes));
+  $('#bet-settings').close();
+  render();
+  $('#bet-settings-button')?.focus({ preventScroll: true });
+};
+$('#close-bet-calculator').onclick = $('#cancel-bet-calculator').onclick = () => $('#bet-calculator').close();
+document.querySelectorAll('[data-calculator-key]').forEach(button => {
+  button.onclick = () => {
+    calculatorKey(button.dataset.calculatorKey);
+    const legal = room?.legal, me = room?.players.find(player => player.id === room.me);
+    const valid = legal?.canRaise && raisePreview(calculatorValue, me, legal, room.bigBlind);
+    $('#bet-calculator-help').textContent = valid
+      ? `${format(legal.min)}~${format(legal.max)}칩 · 000 버튼으로 천 단위 입력`
+      : `${format(legal?.min)}~${format(legal?.max)} 사이의 정수 칩을 입력해 주세요.`;
+  };
+});
+$('#apply-bet-calculator').onclick = () => {
+  const input = $('#raise-amount'), me = room?.players.find(player => player.id === room.me);
+  if (!input || !room?.legal?.canRaise || !raisePreview(calculatorValue, me, room.legal, room.bigBlind)) {
+    $('#bet-calculator-help').textContent = `${format(room?.legal?.min)}~${format(room?.legal?.max)} 사이의 정수 칩을 입력해 주세요.`;
+    return;
+  }
+  input.value = calculatorValue;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  $('#bet-calculator').close();
+  input.focus({ preventScroll: true });
+};
+(async () => {
+  try { await api('/api/session'); } catch { /* The account form remains available if session setup is temporarily unavailable. */ }
+  try { account = (await api('/api/auth/me', undefined, 'GET')).account; } catch { account = null; }
+  renderAuthHeader();
+  home();
+  if (account && code) await resumeRoom();
+})();

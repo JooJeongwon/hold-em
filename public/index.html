@@ -4,78 +4,50 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f2a22">
-  <meta name="description" content="친구들과 함께하는 텍사스 홀덤. 초대 링크 하나로 모이고, 우리 테이블의 기록을 남기세요.">
+  <meta name="description" content="친구들과 가상 칩으로 즐기는 6-max 링게임과 9-max 토너먼트 홀덤.">
   <title>RIVER — 친구들의 홀덤 테이블</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/guide.css">
   <script type="module" src="/app.js"></script>
-  <script type="module" src="/guide.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#app">게임 화면으로 건너뛰기</a>
+  <a class="skip-link" href="#app">본문으로 건너뛰기</a>
   <header class="header">
     <a class="brand" href="/" aria-label="RIVER 홈"><span class="brand-mark">♠</span> RIVER</a>
-    <button class="quiet" id="help-button" aria-haspopup="dialog">족보 / 프리플랍</button>
+    <span id="account-indicator" class="header-note" hidden></span>
+    <button type="button" id="logout-button" class="quiet" hidden>로그아웃</button>
   </header>
   <main id="app" tabindex="-1"></main>
-  <dialog id="member-management" aria-labelledby="member-management-title" aria-describedby="member-management-note">
-    <div class="dialog-head"><h2 id="member-management-title">멤버 관리</h2><button type="button" class="quiet" id="close-member-management" aria-label="멤버 관리 닫기">닫기 ×</button></div>
-    <p id="member-management-note">삭제한 멤버는 새 테이블과 새 기록의 선택 명단에서 제외돼요. 기존 게임 기록과 랭킹은 유지됩니다.</p>
-    <p id="member-management-error" role="alert"></p>
-    <div id="member-delete-confirmation" hidden>
-      <p id="member-delete-question"></p>
-      <div class="member-delete-actions"><button type="button" class="outline" id="cancel-member-delete">취소</button><button type="button" class="outline member-delete" id="confirm-member-delete">삭제 확인</button></div>
-    </div>
-    <ul id="member-management-list"></ul>
-  </dialog>
   <div id="turn-announcement" class="sr-only" role="status" aria-live="polite"></div>
   <dialog id="invite" aria-labelledby="invite-title">
     <div class="dialog-head"><h2 id="invite-title">친구를 테이블로 초대해요</h2><button class="quiet" id="close-invite" aria-label="초대 닫기">닫기 ×</button></div>
-    <p>아래 링크를 친구에게 보내주세요. 같은 링크로 다시 모이면 전적이 이어집니다.</p>
+    <p>아래 링크를 보내세요. 링크를 열고 로그인하면 참가 가능한 방에 바로 들어갑니다.</p>
     <label for="invite-link">초대 링크</label><input id="invite-link" readonly>
     <div class="invite-actions"><button class="primary" id="copy-invite">링크 복사</button><button class="outline" id="share-invite" hidden>공유 메뉴 열기</button></div>
     <p id="invite-feedback" role="status" class="form-note"></p>
   </dialog>
-  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-  <dialog id="guide" aria-labelledby="guide-title">
-    <div class="guide-header">
-      <div class="dialog-head"><h2 id="guide-title">홀덤 가이드</h2><button class="quiet" id="close-guide" aria-label="가이드 닫기">닫기 ×</button></div>
-      <div class="guide-tabs" role="tablist" aria-label="홀덤 가이드 종류">
-        <button id="guide-hands-tab" role="tab" aria-selected="true" aria-controls="guide-hands">홀덤 족보</button>
-        <button id="guide-preflop-tab" role="tab" aria-selected="false" aria-controls="guide-preflop" tabindex="-1">프리플랍 순위</button>
-        <button id="guide-rules-tab" role="tab" aria-selected="false" aria-controls="guide-rules" tabindex="-1">게임 방법</button>
-      </div>
-    </div>
-    <section id="guide-hands" role="tabpanel" aria-labelledby="guide-hands-tab" tabindex="0">
-      <p>강한 족보부터 순서대로예요. 내 카드 2장과 공용 카드 5장 중 가장 좋은 <b>5장</b>으로 비교해요.</p>
-      <ol id="hand-guide" class="guide-rank-list"></ol>
-      <div class="guide-tip"><h3>같은 족보라면?</h3><p>족보를 이루는 숫자를 먼저 비교하고, 같으면 남은 높은 카드인 <b>키커</b>를 차례로 비교해요. 가장 좋은 5장이 모두 같으면 팟을 나눠요. 무늬에는 우열이 없어요.</p><p>A는 가장 높은 카드지만, A-2-3-4-5에서는 1처럼 써요. Q-K-A-2-3처럼 이어 붙일 수는 없어요.</p></div>
-      <p class="guide-source">기준: <a href="https://www.pokerstars.com/poker/games/rules/hand-rankings/" target="_blank" rel="noopener noreferrer">PokerStars 홀덤 족보 ↗</a></p>
-    </section>
-    <section id="guide-preflop" role="tabpanel" aria-labelledby="guide-preflop-tab" tabindex="0" hidden>
-      <p>공용 카드가 나오기 전, 처음 받은 <b>2장의 참고 순위</b>예요. 족보처럼 고정된 승패 순서는 아니에요.</p>
-      <h3>대표적인 상위 시작패 5개</h3>
-      <ol id="preflop-guide" class="guide-rank-list"></ol>
-      <p class="guide-note">PokerStars의 입문용 순서를 따랐어요. 참가 인원, 행동 순서, 상대가 가질 법한 카드에 따라 상대적인 가치가 달라져요. 승률 순위나 자동 베팅 기준은 아니에요.</p>
-      <h3>다른 시작패도 살펴보세요</h3>
-      <p><b>AA</b>는 A 두 장, <b>T</b>는 10이에요. <b>s</b>는 같은 무늬, <b>o</b>는 다른 무늬를 뜻해요. 아래 표에서 s/o가 없으면 두 경우를 모두 포함해요.</p>
-      <div class="preflop-groups">
-        <div><h4>매우 강한 편</h4><p>AA, KK, QQ, JJ, TT, AK</p></div>
-        <div><h4>강한 편</h4><p>99, 88, AQ, AJ, AT, KQ</p></div>
-        <div><h4>상황을 더 살펴볼 패</h4><p>77, 66, 55, KJ, QJ, JT</p></div>
-        <div><h4>약한 편</h4><p>72, J4, T3, 85, Q2, 94</p></div>
-      </div>
-      <p class="guide-note">대표 예시만 모았고, 같은 그룹 안의 나열 순서는 서열이 아니에요. 같은 숫자 조합이라면 같은 무늬일 때 플러시를 만들 기회가 더 있어요.</p>
-      <p class="guide-source">기준: <a href="https://www.pokerstars.com/poker/games/rules/hand-rankings/starting-hands/" target="_blank" rel="noopener noreferrer">PokerStars 시작패 순위와 분류 ↗</a></p>
-    </section>
-    <section id="guide-rules" role="tabpanel" aria-labelledby="guide-rules-tab" tabindex="0" hidden>
-      <p>내 카드와 공용 카드로 가장 강한 5장을 만들어요. 끝까지 남은 사람 중 가장 높은 족보가 팟을 가져가요. 다른 사람이 모두 폴드하면 바로 승리해요.</p>
-      <ol class="steps"><li><b>프리플랍</b> 내 카드 2장을 받고 첫 베팅</li><li><b>플랍</b> 공용 카드 3장을 공개하고 베팅</li><li><b>턴 / 리버</b> 1장씩 더 공개할 때마다 베팅</li><li><b>쇼다운</b> 남은 플레이어의 패를 비교해 정산</li></ol>
-      <div class="guide-actions"><p><b>체크</b> 맞춰야 할 베팅이 없을 때 추가 칩 없이 넘겨요.</p><p><b>콜</b> 앞선 베팅 금액에 맞춰요.</p><p><b>레이즈</b> 이번 라운드의 총 베팅액을 높여요.</p><p><b>폴드</b> 이번 핸드를 포기해요.</p></div>
-      <p class="guide-tip">최대 9명, 가상 칩 <b>20,000개</b>로 시작해요. 블라인드는 100 / 200, 행동 시간은 45초예요. 칩을 모두 쓰면 20,000개를 다시 충전할 수 있어요. 현금 결제와 환전은 없어요.</p>
-    </section>
+  <dialog id="bet-settings" aria-labelledby="bet-settings-title">
+    <div class="dialog-head"><div><h2 id="bet-settings-title">베팅 사이즈 설정</h2><p id="bet-settings-context"></p></div><button type="button" class="quiet" id="close-bet-settings">닫기 ×</button></div>
+    <form id="bet-settings-form">
+      <section class="bet-settings-group"><h3>프리플롭 <small>4개</small></h3><div class="bet-size-list" id="preflop-size-list"></div></section>
+      <section class="bet-settings-group"><h3>플랍 이후 <small>4~6개</small></h3><div class="bet-size-list" id="postflop-size-list"></div><button type="button" class="outline" id="add-postflop-size">+ 사이즈 추가</button></section>
+      <div class="bet-settings-actions"><button type="submit" class="primary">저장</button></div>
+    </form>
   </dialog>
+  <dialog id="bet-calculator" aria-labelledby="bet-calculator-title">
+    <div class="dialog-head"><h2 id="bet-calculator-title">베팅 금액 계산기</h2><button type="button" class="quiet" id="close-bet-calculator">닫기 ×</button></div>
+    <p class="calculator-display" id="bet-calculator-display" aria-live="polite">0</p>
+    <div class="calculator-keys" aria-label="숫자 키패드">
+      <button type="button" data-calculator-key="7">7</button><button type="button" data-calculator-key="8">8</button><button type="button" data-calculator-key="9">9</button>
+      <button type="button" data-calculator-key="4">4</button><button type="button" data-calculator-key="5">5</button><button type="button" data-calculator-key="6">6</button>
+      <button type="button" data-calculator-key="1">1</button><button type="button" data-calculator-key="2">2</button><button type="button" data-calculator-key="3">3</button>
+      <button type="button" data-calculator-key="clear">C</button><button type="button" data-calculator-key="0">0</button><button type="button" data-calculator-key="delete">⌫</button>
+      <button type="button" class="calculator-thousands" data-calculator-key="000">000</button>
+    </div>
+    <p id="bet-calculator-help" class="form-note">칩 단위로 입력해 주세요.</p>
+    <div class="bet-settings-actions"><button type="button" class="outline" id="cancel-bet-calculator">취소</button><button type="button" class="primary" id="apply-bet-calculator">적용</button></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>
 </html>
